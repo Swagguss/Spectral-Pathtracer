@@ -43,5 +43,8 @@
 # Build outputs
 x64/
 
+# Compiled shaders
+*.spv
+
 # debug information files
 *.dwo
