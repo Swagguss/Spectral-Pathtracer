@@ -54,8 +54,7 @@
               "RelativeToolTip": "src\\bvh.h",
               "ViewState": "AgIAABMAAAAAAAAAAAAgwBEAAAAXAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000680|",
-              "WhenOpened": "2026-03-13T03:29:54.392Z",
-              "EditorCaption": ""
+              "WhenOpened": "2026-03-13T03:29:54.392Z"
             },
             {
               "$type": "Document",
@@ -91,8 +90,7 @@
               "RelativeToolTip": "src\\obj_loader.cpp",
               "ViewState": "AgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
-              "WhenOpened": "2026-03-13T03:29:28.282Z",
-              "EditorCaption": ""
+              "WhenOpened": "2026-03-13T03:29:28.282Z"
             },
             {
               "$type": "Document",
@@ -102,7 +100,7 @@
               "RelativeDocumentMoniker": "Shared\\wavefront_rt.comp",
               "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\wavefront_rt.comp",
               "RelativeToolTip": "Shared\\wavefront_rt.comp",
-              "ViewState": "AgIAAMsDAAAAAAAAAAAuwNoDAAADAAAAAAAAAA==",
+              "ViewState": "AgIAAE0HAAAAAAAAAAAuwGwHAAAjAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
               "WhenOpened": "2026-03-13T03:20:50.502Z",
               "EditorCaption": ""
@@ -127,7 +125,7 @@
               "RelativeDocumentMoniker": "src\\main.cpp",
               "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\main.cpp",
               "RelativeToolTip": "src\\main.cpp",
-              "ViewState": "AgIAAEEIAAAAAAAAAAAQwFYIAAANAAAAAAAAAA==",
+              "ViewState": "AgIAACEAAAAAAAAAAAAAADgAAAAbAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
               "WhenOpened": "2026-03-12T14:04:27.965Z",
               "EditorCaption": ""

@@ -9,11 +9,46 @@ const float PI = 3.14159265358979323846;
 const float EPS = 1e-4;
 const float INF_T = 1e30;
 
+const uint MNEE_ITERS     = 2u;
+const uint  MNEE_SPP      = 1u;
+const float MNEE_PROB_MIN = 0.05;
+const float MNEE_PROB_MAX = 0.50;
+const float MNEE_EPS_UV    = 1e-4;
+const float MNEE_EPS_C     = 5e-4;
+const float MNEE_EPS_PIVOT = 1e-10;
+
+const uint EVT_REFRACT = 0u;
+const uint EVT_REFLECT = 1u;
+
+const float LAMBDA_MIN = 400.0;
+const float LAMBDA_MAX = 700.0;
+const float XYZ_NORMALIZE = 0.00936;
+
+struct MneeSeed {
+    uint count;
+    uvec3 tri;
+    vec2 uv[3];
+    uvec3 evt;
+};
+
+struct MneeSolve {
+    bool ok;
+    float invAbsDetJ;
+    MneeSeed seed;
+};
+
 struct GpuPathState {
     vec4 ro;
     vec4 rd;
-    vec4 throughput;
-    vec4 radiance;
+
+    // x = scalar spectral throughput
+    // y = sampled wavelength in nm
+    // z,w unused
+    vec4 throughput_lambda;
+
+    // xyz = accumulated XYZ radiance for this path
+    vec4 radianceXYZ;
+
     uint pixelIndex;
     uint alive;
     uint bounce;
@@ -22,7 +57,7 @@ struct GpuPathState {
 
 struct DielectricSample {
     vec3 dir;
-    vec3 f;
+    float f;
     float pdf;
     uint isTransmission;
     uint isDelta;
@@ -119,6 +154,103 @@ vec3 clamp_rgb_luma(vec3 color, float maxLuma) {
     return color * (maxLuma / luma);
 }
 
+float gauss1(float x, float mu, float sigma) {
+    float t = (x - mu) / sigma;
+    return exp(-0.5 * t * t);
+}
+
+float rgb_to_spectrum_unit(float lambda, vec3 rgb) {
+    float Sr = exp(-((lambda - 610.0) / 60.0) * ((lambda - 610.0) / 60.0));
+    float Sg = exp(-((lambda - 540.0) / 60.0) * ((lambda - 540.0) / 60.0));
+    float Sb = exp(-((lambda - 460.0) / 30.0) * ((lambda - 460.0) / 30.0));
+
+    float denom = max(Sr + Sg + Sb, 1e-6);
+    vec3 c = max(rgb, vec3(0.0));
+    return (c.r * Sr + c.g * Sg + c.b * Sb) / denom;
+}
+
+float rgb_to_reflectance_spectrum(float lambda, vec3 rgb) {
+    vec3 c = clamp(rgb, vec3(0.0), vec3(1.0));
+    float m = max(c.r, max(c.g, c.b));
+    if (m <= 0.0) return 0.0;
+
+    vec3 chroma = c / m;
+    float s = rgb_to_spectrum_unit(lambda, chroma);
+    return clamp(m * s, 0.0, 0.999);
+}
+
+float rgb_to_emission_spectrum(float lambda, vec3 rgb) {
+    vec3 c = max(rgb, vec3(0.0));
+    float m = max(c.r, max(c.g, c.b));
+    if (m <= 0.0) return 0.0;
+
+    vec3 chroma = c / m;
+    float s = rgb_to_spectrum_unit(lambda, chroma);
+    return m * s;
+}
+
+vec3 cie_xyz_bar(float lambda) {
+    float x =
+        1.056 * gauss1(lambda, 599.8, 37.9) +
+        0.362 * gauss1(lambda, 442.0, 16.0) -
+        0.065 * gauss1(lambda, 501.1, 20.4);
+
+    float y =
+        0.821 * gauss1(lambda, 568.8, 23.4) +
+        0.286 * gauss1(lambda, 530.9, 32.3);
+
+    float z =
+        1.217 * gauss1(lambda, 437.0, 11.8) +
+        0.681 * gauss1(lambda, 459.0, 26.0);
+
+    return max(vec3(x, y, z), vec3(0.0)) * XYZ_NORMALIZE;
+}
+
+vec3 xyz_to_linear_srgb(vec3 xyz) {
+    float r =  3.2406 * xyz.x - 1.5372 * xyz.y - 0.4986 * xyz.z;
+    float g = -0.9689 * xyz.x + 1.8758 * xyz.y + 0.0415 * xyz.z;
+    float b =  0.0557 * xyz.x - 0.2040 * xyz.y + 1.0570 * xyz.z;
+    return vec3(r, g, b);
+}
+
+float iorAtLambda(float iorD, float dispersionStrength, float lambdaNm) {
+    float lambda = lambdaNm * 1e-3; // um
+    float V = mix(80.0, 10.0, clamp(dispersionStrength, 0.0, 1.0));
+
+    float lambdaD = 0.5876;
+    float lambdaF = 0.4861;
+    float lambdaC = 0.6563;
+
+    float dN = (iorD - 1.0) / V;
+    float denom = (1.0 / (lambdaF * lambdaF)) - (1.0 / (lambdaC * lambdaC));
+    float B = dN / denom;
+    float A = iorD - B / (lambdaD * lambdaD);
+
+    return A + B / (lambda * lambda);
+}
+
+vec3 whiteBalanceRGB() {
+    vec3 xyzE = vec3(0.0);
+    const int N = 64;
+    for (int i = 0; i < N; ++i) {
+        float u = (float(i) + 0.5) / float(N);
+        float lambda = mix(LAMBDA_MIN, LAMBDA_MAX, u);
+        xyzE += cie_xyz_bar(lambda);
+    }
+    xyzE *= (LAMBDA_MAX - LAMBDA_MIN) / float(N);
+    return max(xyz_to_linear_srgb(xyzE), vec3(1e-6));
+}
+
+float mneeAttemptProb(float receiverDiffuseLike, uint depth) {
+    if (depth != 0u) return 0.0;
+    if (frame.extra.x == 0u) return 0.0;
+
+    float dl = clamp(receiverDiffuseLike, 0.0, 1.0);
+    if (dl <= 0.0) return 0.0;
+
+    return mix(MNEE_PROB_MIN, MNEE_PROB_MAX, dl);
+}
+
 vec3 loadVertex(uint vertexIndex) {
     uint base = vertexIndex * 3u;
     return vec3(
@@ -137,8 +269,21 @@ void loadTriangle(uint triIndex, out vec3 v0, out vec3 v1, out vec3 v2) {
     v2 = loadVertex(i2);
 }
 
+vec3 triPointBaryUnclamped(uint triIndex, float u, float v) {
+    vec3 v0, v1, v2;
+    loadTriangle(triIndex, v0, v1, v2);
+    float w = 1.0 - u - v;
+    return w * v0 + u * v1 + v * v2;
+}
+
 vec3 triangleNormal(vec3 v0, vec3 v1, vec3 v2) {
     return normalize(cross(v1 - v0, v2 - v0));
+}
+
+vec3 triNormalFlat(uint triIndex) {
+    vec3 v0, v1, v2;
+    loadTriangle(triIndex, v0, v1, v2);
+    return triangleNormal(v0, v1, v2);
 }
 
 vec2 sampleUniformTriangle(vec2 u) {
@@ -262,7 +407,21 @@ bool isDeltaTransmission(float transmission) {
     return transmission > 0.001;
 }
 
+bool isMneeSpecular(uint triIndex) {
+    uint matIndex = triangleMaterialIndices[triIndex];
+    Material m = materials[matIndex];
+    return (m.metallic_smoothShading_transmission_ior.z > 0.0) &&
+           (m.albedo_smoothness.w > 0.999);
+}
+
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
+    float m = 1.0 - saturate(cosTheta);
+    float m2 = m * m;
+    float m5 = m2 * m2 * m;
+    return F0 + (1.0 - F0) * m5;
+}
+
+float fresnelSchlickScalar(float cosTheta, float F0) {
     float m = 1.0 - saturate(cosTheta);
     float m2 = m * m;
     float m5 = m2 * m2 * m;
@@ -517,14 +676,14 @@ vec3 sampleBSDF(
     return L;
 }
 
-vec3 evalDielectricMicrofacet(
+float evalDielectricMicrofacet(
     vec3 N,
     vec3 V,
     vec3 L,
     float roughness,
     float etaI,
     float etaT,
-    vec3 transColor,
+    float transColor,
     out bool isTransmission
 ) {
     float NoV = dot(N, V);
@@ -532,7 +691,7 @@ vec3 evalDielectricMicrofacet(
 
     if (abs(NoV) < 1e-6 || abs(NoL) < 1e-6) {
         isTransmission = false;
-        return vec3(0.0);
+        return 0.0;
     }
 
     bool reflectMode = (NoV * NoL > 0.0);
@@ -546,19 +705,20 @@ vec3 evalDielectricMicrofacet(
 
         float NoH = saturate(dot(N, H));
         float VoH = saturate(dot(V, H));
-        if (VoH <= 1e-8) return vec3(0.0);
+        if (VoH <= 1e-8) return 0.0;
 
         float F = fresnelDielectric(VoH, etaI, etaT);
         float D = D_GGX(NoH, alpha);
         float G = G_SmithGGX(abs(NoV), abs(NoL), alpha);
 
-        return vec3(F * D * G / max(4.0 * abs(NoV) * abs(NoL), 1e-8));
+        return F * D * G / max(4.0 * abs(NoV) * abs(NoL), 1e-8);
     } else {
         vec3 Hraw = -(etaI * V + etaT * L);
         float h2 = dot(Hraw, Hraw);
         if (h2 <= 1e-12) {
-            return vec3(0.0);
+            return 0.0;
         }
+
         vec3 H = Hraw * inversesqrt(h2);
         if (dot(H, N) < 0.0) H = -H;
 
@@ -567,7 +727,7 @@ vec3 evalDielectricMicrofacet(
         float LoH = abs(dot(L, H));
 
         if (VoH <= 1e-8 || LoH <= 1e-8) {
-            return vec3(0.0);
+            return 0.0;
         }
 
         float F = fresnelDielectric(VoH, etaI, etaT);
@@ -575,7 +735,8 @@ vec3 evalDielectricMicrofacet(
         float G = G_SmithGGX(abs(NoV), abs(NoL), alpha);
 
         float denom = etaI * VoH + etaT * LoH;
-        float factor = (VoH * LoH) / max(abs(NoV) * abs(NoL) * denom * denom, 1e-8);
+        float factor = (VoH * LoH) /
+            max(abs(NoV) * abs(NoL) * denom * denom, 1e-8);
 
         return transColor * ((1.0 - F) * D * G * factor * etaT * etaT);
     }
@@ -640,14 +801,14 @@ DielectricSample sampleDielectricBSDF(
     vec3 N,
     vec3 V,
     bool frontFace,
-    vec3 albedo,
+    float albedoS,
     float smoothness,
     float ior,
     inout uint rng
 ) {
     DielectricSample s;
     s.dir = vec3(0.0);
-    s.f = vec3(0.0);
+    s.f = 0.0;
     s.pdf = 0.0;
     s.isTransmission = 0u;
     s.isDelta = 0u;
@@ -674,7 +835,7 @@ DielectricSample sampleDielectricBSDF(
             float absNoL = max(abs(dot(N, L)), 1e-8);
 
             s.dir = normalize(L);
-            s.f = vec3(Fr / absNoL);
+            s.f = Fr / absNoL;
             s.pdf = max(Fr, 1e-8);
             s.isTransmission = 0u;
             s.isDelta = 1u;
@@ -689,7 +850,7 @@ DielectricSample sampleDielectricBSDF(
 
             s.dir = normalize(L);
             float etaScale = (etaT * etaT) / max(etaI * etaI, 1e-8);
-            s.f = albedo * ((1.0 - Fr) * etaScale / absNoL);
+            s.f = albedoS * ((1.0 - Fr) * etaScale / absNoL);
             s.pdf = max(1.0 - Fr, 1e-8);
             s.isTransmission = 1u;
             s.isDelta = 1u;
@@ -707,10 +868,10 @@ DielectricSample sampleDielectricBSDF(
         }
 
         bool isTransmission = false;
-        vec3 f = evalDielectricMicrofacet(N, V, L, roughness, etaI, etaT, albedo, isTransmission);
+        float f = evalDielectricMicrofacet(N, V, L, roughness, etaI, etaT, albedoS, isTransmission);
         float pdf = pdfDielectricMicrofacet(N, V, L, roughness, etaI, etaT);
 
-        if (isTransmission || max(f.r, max(f.g, f.b)) <= 1e-8 || pdf <= 1e-8) {
+        if (isTransmission || f <= 1e-8 || pdf <= 1e-8) {
             return s;
         }
 
@@ -733,10 +894,10 @@ DielectricSample sampleDielectricBSDF(
         }
 
         bool isTransmission = false;
-        vec3 f = evalDielectricMicrofacet(N, V, L, roughness, etaI, etaT, albedo, isTransmission);
+        float f = evalDielectricMicrofacet(N, V, L, roughness, etaI, etaT, albedoS, isTransmission);
         float pdf = pdfDielectricMicrofacet(N, V, L, roughness, etaI, etaT);
 
-        if (!isTransmission || max(f.r, max(f.g, f.b)) <= 1e-8 || pdf <= 1e-8) {
+        if (!isTransmission || f <= 1e-8 || pdf <= 1e-8) {
             return s;
         }
 
@@ -780,6 +941,783 @@ vec3 evalBSDF(
     return diff + spec;
 }
 
+float evalBSDFScalar(
+    vec3 N,
+    vec3 V,
+    vec3 L,
+    float albedoS,
+    float smoothness,
+    float metallic
+) {
+    float NoV = saturate(dot(N, V));
+    float NoL = saturate(dot(N, L));
+    if (NoV <= 0.0 || NoL <= 0.0) return 0.0;
+
+    vec3 H = normalize(V + L);
+    float NoH = saturate(dot(N, H));
+    float VoH = saturate(dot(V, H));
+
+    float roughness = roughnessFromSmoothness(smoothness);
+    float alpha = roughness * roughness;
+
+    float F0 = mix(0.04, albedoS, metallic);
+    float F = fresnelSchlickScalar(VoH, F0);
+    float D = D_GGX(NoH, alpha);
+    float G = G_SmithGGX(NoV, NoL, alpha);
+
+    float spec = (D * G * F) / max(4.0 * NoV * NoL, 1e-8);
+    float kd = (1.0 - F) * (1.0 - metallic);
+    float diff = kd * albedoS / PI;
+
+    return diff + spec;
+}
+
+vec2 specConstraintReflect(
+    vec3 prevP,
+    vec3 thisP,
+    vec3 nextP,
+    uint triIndex
+) {
+    vec3 wiVec = prevP - thisP;
+    vec3 woVec = nextP - thisP;
+
+    float wiLen2 = dot(wiVec, wiVec);
+    float woLen2 = dot(woVec, woVec);
+    if (wiLen2 <= 1e-20 || woLen2 <= 1e-20) {
+        return vec2(0.0);
+    }
+
+    vec3 wi = wiVec * inversesqrt(wiLen2); // away from vertex toward previous point
+    vec3 wo = woVec * inversesqrt(woLen2); // away from vertex toward next point
+
+    vec3 n = triNormalFlat(triIndex);
+    vec3 T, B;
+    makeBasis(n, T, B);
+
+    // Reflection manifold: wi + wo must be normal-aligned.
+    vec3 r = wi + wo;
+    return vec2(dot(r, T), dot(r, B));
+}
+
+vec2 specConstraintRefract(
+    vec3 prevP,
+    vec3 thisP,
+    vec3 nextP,
+    uint triIndex,
+    float etaI,
+    float etaT
+) {
+    vec3 wiVec = prevP - thisP;
+    vec3 woVec = nextP - thisP;
+
+    float wiLen2 = dot(wiVec, wiVec);
+    float woLen2 = dot(woVec, woVec);
+    if (wiLen2 <= 1e-20 || woLen2 <= 1e-20) {
+        return vec2(0.0);
+    }
+
+    vec3 wi = wiVec * inversesqrt(wiLen2); // away from vertex toward previous point
+    vec3 wo = woVec * inversesqrt(woLen2); // away from vertex toward next point
+
+    vec3 n = triNormalFlat(triIndex);
+    vec3 T, B;
+    makeBasis(n, T, B);
+
+    // Refraction manifold: etaI * wi + etaT * wo must be normal-aligned.
+    vec3 r = etaI * wi + etaT * wo;
+    return vec2(dot(r, T), dot(r, B));
+}
+
+vec2 solve2x2(mat2 A, vec2 b) {
+    float det = A[0][0] * A[1][1] - A[1][0] * A[0][1];
+    if (abs(det) < MNEE_EPS_PIVOT) {
+        return vec2(0.0);
+    }
+
+    mat2 invA = mat2(
+         A[1][1], -A[0][1],
+        -A[1][0],  A[0][0]
+    ) / det;
+
+    return invA * b;
+}
+
+struct Solve4Result {
+    bool ok;
+    float det;
+    vec4 x;
+};
+
+struct Solve6Result {
+    bool ok;
+    float det;
+    float x[6];
+};
+
+Solve4Result solve4x4(float Ain[4][4], vec4 bIn) {
+    Solve4Result outR;
+    outR.ok = false;
+    outR.det = 0.0;
+    outR.x = vec4(0.0);
+
+    float M[4][5];
+
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            M[r][c] = Ain[r][c];
+        }
+        M[r][4] = bIn[r];
+    }
+
+    float det = 1.0;
+    int sign = 1;
+
+    for (int col = 0; col < 4; ++col) {
+        int pivot = col;
+        float pivotAbs = abs(M[col][col]);
+
+        for (int r = col + 1; r < 4; ++r) {
+            float a = abs(M[r][col]);
+            if (a > pivotAbs) {
+                pivotAbs = a;
+                pivot = r;
+            }
+        }
+
+        if (pivotAbs < MNEE_EPS_PIVOT) {
+            return outR;
+        }
+
+        if (pivot != col) {
+            for (int c = col; c < 5; ++c) {
+                float tmp = M[col][c];
+                M[col][c] = M[pivot][c];
+                M[pivot][c] = tmp;
+            }
+            sign = -sign;
+        }
+
+        float diag = M[col][col];
+        det *= diag;
+
+        for (int r = col + 1; r < 4; ++r) {
+            float f = M[r][col] / diag;
+            M[r][col] = 0.0;
+            for (int c = col + 1; c < 5; ++c) {
+                M[r][c] -= f * M[col][c];
+            }
+        }
+    }
+
+    det *= float(sign);
+
+    vec4 x = vec4(0.0);
+    for (int r = 3; r >= 0; --r) {
+        float sum = M[r][4];
+        for (int c = r + 1; c < 4; ++c) {
+            sum -= M[r][c] * x[c];
+        }
+        x[r] = sum / M[r][r];
+    }
+
+    outR.ok = true;
+    outR.det = det;
+    outR.x = x;
+    return outR;
+}
+
+Solve6Result solve6x6(float Ain[6][6], float bIn[6]) {
+    Solve6Result outR;
+    outR.ok = false;
+    outR.det = 0.0;
+    for (int i = 0; i < 6; ++i) outR.x[i] = 0.0;
+
+    float M[6][7];
+
+    for (int r = 0; r < 6; ++r) {
+        for (int c = 0; c < 6; ++c) {
+            M[r][c] = Ain[r][c];
+        }
+        M[r][6] = bIn[r];
+    }
+
+    float det = 1.0;
+    int sign = 1;
+
+    for (int col = 0; col < 6; ++col) {
+        int pivot = col;
+        float pivotAbs = abs(M[col][col]);
+
+        for (int r = col + 1; r < 6; ++r) {
+            float a = abs(M[r][col]);
+            if (a > pivotAbs) {
+                pivotAbs = a;
+                pivot = r;
+            }
+        }
+
+        if (pivotAbs < MNEE_EPS_PIVOT) {
+            return outR;
+        }
+
+        if (pivot != col) {
+            for (int c = col; c < 7; ++c) {
+                float tmp = M[col][c];
+                M[col][c] = M[pivot][c];
+                M[pivot][c] = tmp;
+            }
+            sign = -sign;
+        }
+
+        float diag = M[col][col];
+        det *= diag;
+
+        for (int r = col + 1; r < 6; ++r) {
+            float f = M[r][col] / diag;
+            M[r][col] = 0.0;
+            for (int c = col + 1; c < 7; ++c) {
+                M[r][c] -= f * M[col][c];
+            }
+        }
+    }
+
+    det *= float(sign);
+
+    float x[6];
+    for (int i = 0; i < 6; ++i) x[i] = 0.0;
+
+    for (int r = 5; r >= 0; --r) {
+        float sum = M[r][6];
+        for (int c = r + 1; c < 6; ++c) {
+            sum -= M[r][c] * x[c];
+        }
+        x[r] = sum / M[r][r];
+    }
+
+    outR.ok = true;
+    outR.det = det;
+    for (int i = 0; i < 6; ++i) outR.x[i] = x[i];
+    return outR;
+}
+
+MneeSeed buildMneeSeed(vec3 x0, vec3 n0, vec3 y, float lambda) {
+    MneeSeed s;
+    s.count = 0u;
+    s.tri = uvec3(0u);
+    s.uv[0] = vec2(0.0);
+    s.uv[1] = vec2(0.0);
+    s.uv[2] = vec2(0.0);
+    s.evt = uvec3(EVT_REFRACT);
+
+    vec3 d0 = y - x0;
+    float dist2 = dot(d0, d0);
+    if (dist2 <= 1e-12) return s;
+
+    float dist = sqrt(dist2);
+    vec3 dir0 = d0 / dist;
+
+    vec3 rayO = x0 + n0 * (5e-5);
+    vec3 rayD = dir0;
+    float tMax = dist - 5e-5;
+
+    for (uint i = 0u; i < 2u; ++i) {
+        if (tMax <= 1e-4) break;
+
+        uint triId;
+        float tHit;
+        vec2 bary;
+        if (!traceClosest(rayO, rayD, triId, tHit, bary)) break;
+        if (tHit >= tMax) break;
+
+        if (!isMneeSpecular(triId)) break;
+
+        s.tri[s.count] = triId;
+        s.uv[s.count] = bary;
+        s.evt[s.count] = EVT_REFRACT;
+        s.count++;
+
+        float step = tHit + 5e-5;
+        rayO += rayD * step;
+        tMax -= step;
+    }
+
+    if (s.count < 2u) return s;
+
+    vec3 p0 = triPointBaryUnclamped(s.tri[0], s.uv[0].x, s.uv[0].y);
+    vec3 p1 = triPointBaryUnclamped(s.tri[1], s.uv[1].x, s.uv[1].y);
+
+    uint matIndex1 = triangleMaterialIndices[s.tri[1]];
+    Material m1 = materials[matIndex1];
+    vec3 wi = normalize(p1 - p0);
+
+    float etaGlass = iorAtLambda(
+        m1.metallic_smoothShading_transmission_ior.w,
+        m1.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x,
+        lambda
+    );
+
+    vec3 n = triNormalFlat(s.tri[1]);
+    float etaI = etaGlass;
+    float etaT = 1.0;
+
+    if (dot(wi, n) > 0.0) {
+        n = -n;
+        float tmp = etaI;
+        etaI = etaT;
+        etaT = tmp;
+    }
+
+    float cosI = abs(dot(wi, -n));
+    float eta = etaI / etaT;
+
+    vec3 tdir;
+    bool hasTransmit = refractDir(wi, n, eta, tdir);
+
+    bool wantsReflect = !hasTransmit;
+    if (!wantsReflect) return s;
+
+    vec3 rdir = reflect(wi, n);
+
+    vec3 o = p1 + rdir * (5e-5);
+    float tRemain = 1e6;
+
+    bool found = false;
+    uint tri2 = 0u;
+    vec2 uv2 = vec2(0.0);
+
+    for (uint attempt = 0u; attempt < 2u; ++attempt) {
+        uint triHit;
+        float tHit;
+        vec2 bary;
+        if (!traceClosest(o, rdir, triHit, tHit, bary)) break;
+
+        if (triHit == s.tri[1]) {
+            float bias = 5e-5;
+            o += rdir * (tHit + bias);
+            tRemain -= (tHit + bias);
+            continue;
+        }
+
+        if (!isMneeSpecular(triHit)) break;
+
+        tri2 = triHit;
+        uv2 = bary;
+        found = true;
+        break;
+    }
+
+    if (!found) return s;
+
+    s.count = 3u;
+    s.evt[0] = EVT_REFRACT;
+    s.evt[1] = EVT_REFLECT;
+    s.tri[2] = tri2;
+    s.uv[2] = uv2;
+    s.evt[2] = EVT_REFRACT;
+
+    return s;
+}
+
+void mneeConstraints(
+    uint count,
+    vec3 x0,
+    vec3 y,
+    MneeSeed seed,
+    float lambda,
+    out float C[6]
+) {
+    for (int k = 0; k < 6; ++k) C[k] = 0.0;
+    if (count == 0u) return;
+
+    vec3 x[3];
+    x[0] = triPointBaryUnclamped(seed.tri[0], seed.uv[0].x, seed.uv[0].y);
+    if (count > 1u) x[1] = triPointBaryUnclamped(seed.tri[1], seed.uv[1].x, seed.uv[1].y);
+    if (count > 2u) x[2] = triPointBaryUnclamped(seed.tri[2], seed.uv[2].x, seed.uv[2].y);
+
+    float etaFrom = 1.0;
+
+    for (uint i = 0u; i < count; ++i) {
+        vec3 prevP = (i > 0u) ? x[i - 1u] : x0;
+        vec3 thisP = x[i];
+        vec3 nextP = ((i + 1u) < count) ? x[i + 1u] : y;
+
+        vec2 c;
+
+        if (seed.evt[i] == EVT_REFLECT) {
+            c = specConstraintReflect(prevP, thisP, nextP, seed.tri[i]);
+        } else {
+            uint matIndex = triangleMaterialIndices[seed.tri[i]];
+            Material mat = materials[matIndex];
+            float etaMat = iorAtLambda(
+                mat.metallic_smoothShading_transmission_ior.w,
+                mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x,
+                lambda
+            );
+
+            float etaTo = (etaFrom == 1.0) ? etaMat : 1.0;
+            c = specConstraintRefract(prevP, thisP, nextP, seed.tri[i], etaFrom, etaTo);
+            etaFrom = etaTo;
+        }
+
+        C[2u * i + 0u] = c.x;
+        C[2u * i + 1u] = c.y;
+    }
+}
+
+float maxAbsConstraints(uint count, float C[6]) {
+    float m = 0.0;
+    uint n = 2u * count;
+    for (uint i = 0u; i < n; ++i) {
+        m = max(m, abs(C[i]));
+    }
+    return m;
+}
+
+MneeSolve mneeNewtonSolve(
+    vec3 x0,
+    vec3 y,
+    float lambda,
+    MneeSeed seed0
+) {
+    MneeSolve outR;
+    outR.ok = false;
+    outR.invAbsDetJ = 0.0;
+    outR.seed = seed0;
+
+    MneeSeed s = seed0;
+    if (s.count == 0u) {
+        return outR;
+    }
+
+    float invAbsDetJ = 0.0;
+
+    for (uint it = 0u; it < MNEE_ITERS; ++it) {
+        float C[6];
+        for (uint k = 0u; k < 6u; ++k) C[k] = 0.0;
+        mneeConstraints(s.count, x0, y, s, lambda, C);
+
+        float maxC = maxAbsConstraints(s.count, C);
+        if (maxC < MNEE_EPS_C) {
+            outR.ok = true;
+            outR.invAbsDetJ = invAbsDetJ;
+            outR.seed = s;
+            return outR;
+        }
+
+        if (s.count == 1u) {
+            vec2 C0 = vec2(C[0], C[1]);
+
+            MneeSeed sp = s;
+            sp.uv[0] += vec2(MNEE_EPS_UV, 0.0);
+            float CpA[6];
+            for (uint k = 0u; k < 6u; ++k) CpA[k] = 0.0;
+            mneeConstraints(1u, x0, y, sp, lambda, CpA);
+            vec2 d0 = (vec2(CpA[0], CpA[1]) - C0) / MNEE_EPS_UV;
+
+            sp = s;
+            sp.uv[0] += vec2(0.0, MNEE_EPS_UV);
+            float CpB[6];
+            for (uint k = 0u; k < 6u; ++k) CpB[k] = 0.0;
+            mneeConstraints(1u, x0, y, sp, lambda, CpB);
+            vec2 d1 = (vec2(CpB[0], CpB[1]) - C0) / MNEE_EPS_UV;
+
+            mat2 J = mat2(d0, d1);
+            float detJ = J[0][0] * J[1][1] - J[1][0] * J[0][1];
+            if (abs(detJ) < MNEE_EPS_PIVOT) {
+                return outR;
+            }
+
+            invAbsDetJ = abs(1.0 / detJ);
+
+            vec2 delta = solve2x2(J, -C0);
+            s.uv[0] += delta;
+        }
+        else if (s.count == 2u) {
+            vec4 C0 = vec4(C[0], C[1], C[2], C[3]);
+
+            float J[4][4];
+
+            MneeSeed sp = s;
+            sp.uv[0] += vec2(MNEE_EPS_UV, 0.0);
+            float C1[6];
+            for (uint k = 0u; k < 6u; ++k) C1[k] = 0.0;
+            mneeConstraints(2u, x0, y, sp, lambda, C1);
+            vec4 d0 = (vec4(C1[0], C1[1], C1[2], C1[3]) - C0) / MNEE_EPS_UV;
+
+            sp = s;
+            sp.uv[0] += vec2(0.0, MNEE_EPS_UV);
+            float C2[6];
+            for (uint k = 0u; k < 6u; ++k) C2[k] = 0.0;
+            mneeConstraints(2u, x0, y, sp, lambda, C2);
+            vec4 d1 = (vec4(C2[0], C2[1], C2[2], C2[3]) - C0) / MNEE_EPS_UV;
+
+            sp = s;
+            sp.uv[1] += vec2(MNEE_EPS_UV, 0.0);
+            float C3[6];
+            for (uint k = 0u; k < 6u; ++k) C3[k] = 0.0;
+            mneeConstraints(2u, x0, y, sp, lambda, C3);
+            vec4 d2 = (vec4(C3[0], C3[1], C3[2], C3[3]) - C0) / MNEE_EPS_UV;
+
+            sp = s;
+            sp.uv[1] += vec2(0.0, MNEE_EPS_UV);
+            float C4[6];
+            for (uint k = 0u; k < 6u; ++k) C4[k] = 0.0;
+            mneeConstraints(2u, x0, y, sp, lambda, C4);
+            vec4 d3 = (vec4(C4[0], C4[1], C4[2], C4[3]) - C0) / MNEE_EPS_UV;
+
+            J[0][0] = d0.x; J[0][1] = d1.x; J[0][2] = d2.x; J[0][3] = d3.x;
+            J[1][0] = d0.y; J[1][1] = d1.y; J[1][2] = d2.y; J[1][3] = d3.y;
+            J[2][0] = d0.z; J[2][1] = d1.z; J[2][2] = d2.z; J[2][3] = d3.z;
+            J[3][0] = d0.w; J[3][1] = d1.w; J[3][2] = d2.w; J[3][3] = d3.w;
+
+            Solve4Result sol = solve4x4(J, -C0);
+            if (!sol.ok || abs(sol.det) < MNEE_EPS_PIVOT) {
+                return outR;
+            }
+
+            invAbsDetJ = abs(1.0 / sol.det);
+
+            s.uv[0] += vec2(sol.x.x, sol.x.y);
+            s.uv[1] += vec2(sol.x.z, sol.x.w);
+        }
+        else {
+            float C0[6];
+            for (uint k = 0u; k < 6u; ++k) C0[k] = C[k];
+
+            float J[6][6];
+            for (uint r = 0u; r < 6u; ++r) {
+                for (uint c = 0u; c < 6u; ++c) {
+                    J[r][c] = 0.0;
+                }
+            }
+
+            for (uint col = 0u; col < 6u; ++col) {
+                MneeSeed sp = s;
+                uint vi = col / 2u;
+                uint uvComp = col - 2u * vi;
+
+                if (uvComp == 0u) {
+                    sp.uv[vi] += vec2(MNEE_EPS_UV, 0.0);
+                } else {
+                    sp.uv[vi] += vec2(0.0, MNEE_EPS_UV);
+                }
+
+                float Cp[6];
+                for (uint k = 0u; k < 6u; ++k) Cp[k] = 0.0;
+                mneeConstraints(3u, x0, y, sp, lambda, Cp);
+
+                for (uint r = 0u; r < 6u; ++r) {
+                    J[r][col] = (Cp[r] - C0[r]) / MNEE_EPS_UV;
+                }
+            }
+
+            float b[6];
+            for (uint r = 0u; r < 6u; ++r) {
+                b[r] = -C0[r];
+            }
+
+            Solve6Result sol = solve6x6(J, b);
+            if (!sol.ok || abs(sol.det) < MNEE_EPS_PIVOT) {
+                return outR;
+            }
+
+            invAbsDetJ = abs(1.0 / sol.det);
+
+            s.uv[0] += vec2(sol.x[0], sol.x[1]);
+            s.uv[1] += vec2(sol.x[2], sol.x[3]);
+            s.uv[2] += vec2(sol.x[4], sol.x[5]);
+        }
+    }
+
+    float Cf[6];
+    for (uint k = 0u; k < 6u; ++k) Cf[k] = 0.0;
+    mneeConstraints(s.count, x0, y, s, lambda, Cf);
+
+    float maxC = maxAbsConstraints(s.count, Cf);
+    if (maxC < 2.0 * MNEE_EPS_C) {
+        outR.ok = true;
+        outR.invAbsDetJ = invAbsDetJ;
+        outR.seed = s;
+        return outR;
+    }
+
+    return outR;
+}
+
+float mneeAreaCaustic(
+    vec3 x0,
+    vec3 n0,
+    vec3 V0,
+    vec3 albedo,
+    float smoothness,
+    float metallic,
+    float lambda,
+    inout uint rng
+) {
+    if (frame.extra.x == 0u) return 0.0;
+
+    uint lightSlot = sampleEmissiveTriangle(rand01(rng));
+    uint triL = emissiveTriangles[lightSlot].triIndex_pad.x;
+    float lightArea = emissiveTriangles[lightSlot].area_pmf_cdf_pad.x;
+    float lightPmf  = emissiveTriangles[lightSlot].area_pmf_cdf_pad.y;
+
+    vec3 lv0, lv1, lv2;
+    loadTriangle(triL, lv0, lv1, lv2);
+
+    vec2 su = vec2(rand01(rng), rand01(rng));
+    vec2 sb = sampleUniformTriangle(su);
+    float bw = 1.0 - sb.x - sb.y;
+    vec3 y = bw * lv0 + sb.x * lv1 + sb.y * lv2;
+
+    vec3 lightN = triangleNormal(lv0, lv1, lv2);
+
+    vec3 toL0 = y - x0;
+    float dist2_0 = dot(toL0, toL0);
+    if (dist2_0 <= 1e-12) return 0.0;
+
+    float invDist0 = inversesqrt(dist2_0);
+    vec3 wi0 = toL0 * invDist0;
+
+    float cosAtLight0 = max(dot(lightN, -wi0), 0.0);
+    if (cosAtLight0 <= 1e-8) return 0.0;
+
+    float pdfW = (lightPmf / max(lightArea, 1e-8)) * dist2_0 / max(cosAtLight0, 1e-8);
+    float pdfA = lightPmf / max(lightArea, 1e-8);
+    if (pdfW <= 0.0 || pdfA <= 0.0) return 0.0;
+
+    MneeSeed seedChain = buildMneeSeed(x0, n0, y, lambda);
+    if (seedChain.count == 0u) return 0.0;
+
+    MneeSolve sol = mneeNewtonSolve(x0, y, lambda, seedChain);
+    if (!sol.ok || sol.invAbsDetJ <= 0.0) return 0.0;
+
+    uint count = sol.seed.count;
+
+    vec3 x[3];
+    x[0] = triPointBaryUnclamped(sol.seed.tri[0], sol.seed.uv[0].x, sol.seed.uv[0].y);
+    if (count > 1u) x[1] = triPointBaryUnclamped(sol.seed.tri[1], sol.seed.uv[1].x, sol.seed.uv[1].y);
+    if (count > 2u) x[2] = triPointBaryUnclamped(sol.seed.tri[2], sol.seed.uv[2].x, sol.seed.uv[2].y);
+
+    vec3 xLast = x[count - 1u];
+
+    vec3 L0 = normalize(x[0] - x0);
+    float NoL0 = saturate(dot(n0, L0));
+    if (NoL0 <= 0.0) return 0.0;
+
+    float albedoS = rgb_to_reflectance_spectrum(lambda, albedo);
+    float f0 = evalBSDFScalar(n0, V0, L0, albedoS, smoothness, metallic);
+    if (f0 <= 0.0) return 0.0;
+
+    float specW = 1.0;
+    float etaFrom = 1.0;
+    float TrGlass = 1.0;
+
+    for (uint i = 0u; i < count; ++i) {
+        uint triS = sol.seed.tri[i];
+        uint matIndex = triangleMaterialIndices[triS];
+        Material matS = materials[matIndex];
+
+        float tr = clamp(matS.metallic_smoothShading_transmission_ior.z, 0.0, 1.0);
+        float tintS = clamp(rgb_to_reflectance_spectrum(lambda, matS.albedo_smoothness.xyz), 0.0, 1.0);
+
+        float surfTintT = mix(1.0, tintS, tr);
+        float surfTintR = mix(1.0, tintS, 0.05 * tr);
+
+        vec3 prevP = (i > 0u) ? x[i - 1u] : x0;
+        vec3 thisP = x[i];
+        vec3 wi = normalize(thisP - prevP);
+
+        float etaMat = iorAtLambda(
+            matS.metallic_smoothShading_transmission_ior.w,
+            matS.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x,
+            lambda
+        );
+
+        vec3 n = triNormalFlat(triS);
+
+        if (sol.seed.evt[i] == EVT_REFLECT) {
+            float etaI = etaFrom;
+            float etaT = (etaFrom != 1.0) ? 1.0 : etaMat;
+
+            if (dot(wi, n) > 0.0) {
+                n = -n;
+                float tmp = etaI; etaI = etaT; etaT = tmp;
+            }
+
+            vec3 tdir;
+            bool hasTransmit = refractDir(wi, n, etaI / etaT, tdir);
+
+            if (!hasTransmit) {
+                specW *= surfTintR;
+            } else {
+                float cosI = abs(dot(wi, n));
+                float F = fresnelDielectric(cosI, etaI, etaT);
+                specW *= F * surfTintR;
+            }
+        } else {
+            float etaTo = (etaFrom == 1.0) ? etaMat : 1.0;
+            float etaI = etaFrom;
+            float etaT = etaTo;
+
+            if (dot(wi, n) > 0.0) {
+                n = -n;
+                float tmp = etaI; etaI = etaT; etaT = tmp;
+            }
+
+            float cosI = abs(dot(wi, n));
+            float F = fresnelDielectric(cosI, etaI, etaT);
+
+            specW *= tr * (1.0 - F) * surfTintT;
+            specW *= (etaI * etaI) / max(etaT * etaT, 1e-8);
+
+            etaFrom = etaTo;
+        }
+
+        if (specW <= 0.0) return 0.0;
+    }
+
+    uint lightMatIndex = triangleMaterialIndices[triL];
+    Material lightMat = materials[lightMatIndex];
+    vec3 LeRGB = lightMat.emissive_emissiveIntensity.xyz * lightMat.emissive_emissiveIntensity.w;
+    float LeS = rgb_to_emission_spectrum(lambda, LeRGB);
+
+    float Gprod = 1.0;
+    vec3 prev = x0;
+    vec3 prevN = n0;
+
+    for (uint i = 0u; i < count; ++i) {
+        vec3 curr = x[i];
+        vec3 d = curr - prev;
+        float d2 = dot(d, d);
+        vec3 w = normalize(d);
+
+        vec3 currN = triNormalFlat(sol.seed.tri[i]);
+
+        float cosA = abs(dot(prevN, w));
+        float cosB = abs(dot(currN, -w));
+        Gprod *= (cosA * cosB) / max(d2, 1e-8);
+
+        prev = curr;
+        prevN = currN;
+    }
+
+    vec3 toL = y - xLast;
+    float dist2 = dot(toL, toL);
+    vec3 wiL = toL * inversesqrt(max(dist2, 1e-8));
+    float cosL = max(dot(lightN, -wiL), 0.0);
+
+    float contrib =
+        Gprod *
+        LeS *
+        f0 * NoL0 *
+        specW *
+        sol.invAbsDetJ *
+        (cosL / max(dist2, 1e-8)) /
+        max(pdfA, 1e-8);
+
+    return max(contrib, 0.0);
+}
+
 void main() {
     uvec2 pix = gl_GlobalInvocationID.xy;
     uint width = frame.screen.x;
@@ -788,7 +1726,6 @@ void main() {
     if (pix.x >= width || pix.y >= height) return;
 
     uint pixelIndex = pix.y * width + pix.x;
-    uint rng = pixelIndex * 9781u + frame.screen.w * 6271u + 1u;
 
     vec2 uv = (vec2(pix) + vec2(0.5)) / vec2(width, height);
     vec2 ndc = uv * 2.0 - 1.0;
@@ -797,218 +1734,272 @@ void main() {
     float tanHalfFovY = frame.camData.x;
     float aspect = frame.camData.y;
 
-    vec3 ro = frame.camPos.xyz;
-    vec3 rd = normalize(
+    vec3 camRo = frame.camPos.xyz;
+    vec3 camRd = normalize(
         frame.camForward.xyz +
         ndc.x * aspect * tanHalfFovY * frame.camRight.xyz +
         ndc.y * tanHalfFovY * frame.camUp.xyz
     );
 
-    vec3 throughput = vec3(1.0);
-    vec3 radiance = vec3(0.0);
+    const uint LAMBDA_SPP = 4u;
 
-    paths[pixelIndex].ro = vec4(ro, 0.0);
-    paths[pixelIndex].rd = vec4(rd, 0.0);
-    paths[pixelIndex].throughput = vec4(throughput, 0.0);
-    paths[pixelIndex].radiance = vec4(radiance, 0.0);
-    paths[pixelIndex].pixelIndex = pixelIndex;
-    paths[pixelIndex].alive = 1u;
-    paths[pixelIndex].bounce = 0u;
+    vec3 totalRadianceXYZ = vec3(0.0);
 
-    bool prevWasSpecular = true;
+    // Keep some final state for the debug/path buffer write at end.
+    float lastThroughput = 1.0;
+    float lastLambda = 550.0;
+    vec3 lastRadianceXYZ = vec3(0.0);
+    vec3 lastRo = camRo;
+    vec3 lastRd = camRd;
+    uint lastBounce = 0u;
 
-    for (uint bounce = 0u; bounce < frame.extra.w; ++bounce) {
-        uint prim;
-        float tHit;
-        vec2 bary;
-        if (!traceClosest(ro, rd, prim, tHit, bary)) {
-            break;
-        }
+    for (uint ls = 0u; ls < LAMBDA_SPP; ++ls) {
+        uint rng = pixelIndex * 9781u +
+                   frame.screen.w * 6271u +
+                   ls * 26699u + 1u;
 
-        vec3 v0, v1, v2;
-        loadTriangle(prim, v0, v1, v2);
+        vec3 ro = camRo;
+        vec3 rd = camRd;
 
-        uint i0 = indexData[prim * 3u + 0u];
-        uint i1 = indexData[prim * 3u + 1u];
-        uint i2 = indexData[prim * 3u + 2u];
+        float uLambda = (float(ls) + rand01(rng)) / float(LAMBDA_SPP);
+        float lambda = mix(LAMBDA_MIN, LAMBDA_MAX, uLambda);
+        vec3 lambdaXYZ = cie_xyz_bar(lambda) * (LAMBDA_MAX - LAMBDA_MIN);
 
-        vec3 geomN = triangleNormal(v0, v1, v2);
+        float throughput = 1.0;
+        vec3 radianceXYZ = vec3(0.0);
 
-        vec3 hitPos = ro + rd * tHit;
+        bool prevWasSpecular = true;
 
-        uint matIndex = triangleMaterialIndices[prim];
-        Material mat = materials[matIndex];
-
-        vec3 albedo = mat.albedo_smoothness.xyz;
-        float smoothness = mat.albedo_smoothness.w;
-        float metallic = mat.metallic_smoothShading_transmission_ior.x;
-        float transmission = mat.metallic_smoothShading_transmission_ior.z;
-        float ior = mat.metallic_smoothShading_transmission_ior.w;
-        vec3 emissive = mat.emissive_emissiveIntensity.xyz * mat.emissive_emissiveIntensity.w;
-
-        float b1 = bary.x;
-        float b2 = bary.y;
-        float b0 = 1.0 - b1 - b2;
-
-        vec3 n0 = loadNormal(i0);
-        vec3 n1 = loadNormal(i1);
-        vec3 n2 = loadNormal(i2);
-
-        float smoothShading = mat.metallic_smoothShading_transmission_ior.y;
-
-        vec3 smoothN = normalize(n0 * b0 + n1 * b1 + n2 * b2);
-
-        bool frontFace = dot(rd, geomN) < 0.0;
-        vec3 Ng = frontFace ? geomN : -geomN;
-
-        vec3 rawShadeN = (smoothShading > 0.5) ? smoothN : Ng;
-
-        vec3 Ns = normalize(dot(rawShadeN, Ng) >= 0.0 ? rawShadeN : -rawShadeN);
-
-        if (max(emissive.r, max(emissive.g, emissive.b)) > 0.0) {
-            if (bounce == 0u || prevWasSpecular) {
-                radiance += throughput * emissive;
-            } else {
-                // should do MIS-weighted emission on BSDF-hit light
-                // otherwise skip to avoid double counting
+        for (uint bounce = 0u; bounce < frame.extra.w; ++bounce) {
+            uint prim;
+            float tHit;
+            vec2 bary;
+            if (!traceClosest(ro, rd, prim, tHit, bary)) {
+                break;
             }
-        }
 
-        vec3 V = normalize(-rd);
+            vec3 v0, v1, v2;
+            loadTriangle(prim, v0, v1, v2);
 
-        // Area-light NEE
-        if (frame.extra.x > 0u && transmission <= 0.001) {
-            uint lightSlot = sampleEmissiveTriangle(rand01(rng));
-            uint lightTriIndex = emissiveTriangles[lightSlot].triIndex_pad.x;
-            float lightArea = emissiveTriangles[lightSlot].area_pmf_cdf_pad.x;
-            float lightPmf = emissiveTriangles[lightSlot].area_pmf_cdf_pad.y;
+            uint i0 = indexData[prim * 3u + 0u];
+            uint i1 = indexData[prim * 3u + 1u];
+            uint i2 = indexData[prim * 3u + 2u];
 
-            vec3 lv0, lv1, lv2;
-            loadTriangle(lightTriIndex, lv0, lv1, lv2);
+            vec3 geomN = triangleNormal(v0, v1, v2);
+            vec3 hitPos = ro + rd * tHit;
 
-            vec2 u = vec2(rand01(rng), rand01(rng));
-            vec2 b = sampleUniformTriangle(u);
-            float w0 = 1.0 - b.x - b.y;
-            float w1 = b.x;
-            float w2 = b.y;
+            uint matIndex = triangleMaterialIndices[prim];
+            Material mat = materials[matIndex];
 
-            vec3 lightPos = w0 * lv0 + w1 * lv1 + w2 * lv2;
-            vec3 lightN = triangleNormal(lv0, lv1, lv2);
+            vec3 albedo = mat.albedo_smoothness.xyz;
+            float smoothness = mat.albedo_smoothness.w;
+            float metallic = mat.metallic_smoothShading_transmission_ior.x;
+            float transmission = mat.metallic_smoothShading_transmission_ior.z;
+            float ior = mat.metallic_smoothShading_transmission_ior.w;
+            vec3 emissive = mat.emissive_emissiveIntensity.xyz * mat.emissive_emissiveIntensity.w;
 
-            uint lightMatIndex = triangleMaterialIndices[lightTriIndex];
-            Material lightMat = materials[lightMatIndex];
-            vec3 Le = lightMat.emissive_emissiveIntensity.xyz * lightMat.emissive_emissiveIntensity.w;
+            float dispersion = mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x;
 
-            vec3 toLight = lightPos - hitPos;
-            float dist2 = dot(toLight, toLight);
+            float albedoS = rgb_to_reflectance_spectrum(lambda, albedo);
+            float emissiveS = rgb_to_emission_spectrum(lambda, emissive);
+            float iorLambda = iorAtLambda(ior, dispersion, lambda);
 
-            if (dist2 > EPS && lightPmf > 0.0 && lightArea > 0.0) {
-                float dist = sqrt(dist2);
-                vec3 L = toLight / dist;
+            float b1 = bary.x;
+            float b2 = bary.y;
+            float b0 = 1.0 - b1 - b2;
 
-                float NoL = saturate(dot(Ns, L));
-                float cosLight = max(dot(lightN, -L), 0.0);
+            vec3 n0 = loadNormal(i0);
+            vec3 n1 = loadNormal(i1);
+            vec3 n2 = loadNormal(i2);
 
-                if (NoL > 0.0 && cosLight > 0.0) {
-                    bool occluded = traceShadow(hitPos + Ns * EPS, L, dist, lightTriIndex);
-                    if (!occluded) {
-                        float pdfLight = lightPmf / lightArea;
-                        vec3 f = evalBSDF(Ns, V, L, albedo, smoothness, metallic);
-                        float pdfBsdf = bsdfPdf(Ns, V, L, albedo, smoothness, metallic);
+            float smoothShading = mat.metallic_smoothShading_transmission_ior.y;
+            vec3 smoothN = normalize(n0 * b0 + n1 * b1 + n2 * b2);
 
-                        float pdfLightSolidAngle = pdfLight * dist2 / max(cosLight, 1e-8);
-                        float wLight = pdfLightSolidAngle / max(pdfLightSolidAngle + pdfBsdf, 1e-8);
+            bool frontFace = dot(rd, geomN) < 0.0;
+            vec3 Ng = frontFace ? geomN : -geomN;
 
-                        vec3 contrib = Le * f * NoL * wLight / max(pdfLightSolidAngle, 1e-8);
+            vec3 rawShadeN = (smoothShading > 0.5) ? smoothN : Ng;
+            vec3 Ns = normalize(dot(rawShadeN, Ng) >= 0.0 ? rawShadeN : -rawShadeN);
 
-                        radiance += throughput * contrib;
+            if (max(emissive.r, max(emissive.g, emissive.b)) > 0.0) {
+                if (bounce == 0u || prevWasSpecular) {
+                    radianceXYZ += (throughput * emissiveS) * lambdaXYZ;
+                } else {
+                    // TODO: MIS-weighted emission on BSDF-hit light
+                }
+            }
+
+            vec3 V = normalize(-rd);
+
+            // Area-light NEE for opaque branch
+            if (frame.extra.x > 0u && transmission <= 0.001) {
+                uint lightSlot = sampleEmissiveTriangle(rand01(rng));
+                uint lightTriIndex = emissiveTriangles[lightSlot].triIndex_pad.x;
+                float lightArea = emissiveTriangles[lightSlot].area_pmf_cdf_pad.x;
+                float lightPmf = emissiveTriangles[lightSlot].area_pmf_cdf_pad.y;
+
+                vec3 lv0, lv1, lv2;
+                loadTriangle(lightTriIndex, lv0, lv1, lv2);
+
+                vec2 u = vec2(rand01(rng), rand01(rng));
+                vec2 b = sampleUniformTriangle(u);
+                float w0 = 1.0 - b.x - b.y;
+                float w1 = b.x;
+                float w2 = b.y;
+
+                vec3 lightPos = w0 * lv0 + w1 * lv1 + w2 * lv2;
+                vec3 lightN = triangleNormal(lv0, lv1, lv2);
+
+                uint lightMatIndex = triangleMaterialIndices[lightTriIndex];
+                Material lightMat = materials[lightMatIndex];
+                vec3 Le = lightMat.emissive_emissiveIntensity.xyz * lightMat.emissive_emissiveIntensity.w;
+
+                vec3 toLight = lightPos - hitPos;
+                float dist2 = dot(toLight, toLight);
+
+                if (dist2 > EPS && lightPmf > 0.0 && lightArea > 0.0) {
+                    float dist = sqrt(dist2);
+                    vec3 L = toLight / dist;
+
+                    float NoL = saturate(dot(Ns, L));
+                    float cosLight = max(dot(lightN, -L), 0.0);
+
+                    if (NoL > 0.0 && cosLight > 0.0) {
+                        bool occluded = traceShadow(hitPos + Ns * EPS, L, dist, lightTriIndex);
+                        if (!occluded) {
+                            float pdfLight = lightPmf / lightArea;
+
+                            float LeS = rgb_to_emission_spectrum(lambda, Le);
+                            float fS = evalBSDFScalar(Ns, V, L, albedoS, smoothness, metallic);
+                            float pdfBsdf = bsdfPdf(Ns, V, L, vec3(albedoS), smoothness, metallic);
+
+                            float pdfLightSolidAngle = pdfLight * dist2 / max(cosLight, 1e-8);
+                            float wLight = pdfLightSolidAngle / max(pdfLightSolidAngle + pdfBsdf, 1e-8);
+
+                            float contrib = LeS * fS * NoL * wLight / max(pdfLightSolidAngle, 1e-8);
+                            radianceXYZ += (throughput * contrib) * lambdaXYZ;
+                        }
                     }
                 }
             }
-        }
 
-        float rrP = max(throughput.r, max(throughput.g, throughput.b));
-        rrP = clamp(rrP, 0.05, 0.95);
+            // MNEE on primary hit
+            if (bounce == 0u && frame.extra.x > 0u) {
+                float receiverWeight = clamp(1.0 - smoothness, 0.0, 1.0);
+                float pMnee = mneeAttemptProb(receiverWeight, bounce);
 
-        if (bounce >= 2u) {
-            if (rand01(rng) > rrP) {
-                break;
-            }
-            throughput /= rrP;
-        }
+                if (pMnee > 0.0 && rand01(rng) < pMnee) {
+                    float sum = 0.0;
+                    for (uint s = 0u; s < MNEE_SPP; ++s) {
+                        sum += 0.0000003 * mneeAreaCaustic(
+                            hitPos,
+                            Ns,
+                            V,
+                            albedo,
+                            smoothness,
+                            metallic,
+                            lambda,
+                            rng
+                        );
+                    }
 
-        vec3 F0 = mix(vec3(0.04), albedo, metallic);
-
-        vec3 newDir;
-        vec3 f = vec3(0.0);
-        float NoL = 0.0;
-
-        bool didDeltaEvent = false;
-        bool wasSpecularEvent = false;
-
-        DielectricSample ds;
-        float transmissionWeight = clamp(transmission, 0.0, 1.0);
-
-        if (transmission > 0.001) {
-            vec3 Nd = Ns;
-            ds = sampleDielectricBSDF(Nd, V, frontFace, albedo, smoothness, ior, rng);
-
-            float absNoL = abs(dot(Nd, ds.dir));
-            if (ds.pdf <= 1e-8 || absNoL <= 1e-8 || max(ds.f.r, max(ds.f.g, ds.f.b)) <= 1e-8) {
-                break;
+                    float mneeAvg = sum / float(MNEE_SPP);
+                    radianceXYZ += (throughput * lambdaXYZ) * (mneeAvg / max(pMnee, 1e-8));
+                }
             }
 
-            throughput *= ds.f * absNoL / ds.pdf;
-
-            newDir = normalize(ds.dir);
-            wasSpecularEvent = (ds.isDelta != 0u) || (ds.isTransmission != 0u);
-
-            vec3 pushNg = dot(newDir, Ng) >= 0.0 ? Ng : -Ng;
-            ro = hitPos + pushNg * EPS + newDir * EPS;
-            rd = newDir;
-        } else {
-            vec2 uSelect = vec2(rand01(rng), rand01(rng));
-            vec2 uDir    = vec2(rand01(rng), rand01(rng));
-
-            float pdf;
-            newDir = sampleBSDF(Ns, V, albedo, smoothness, metallic, uSelect, uDir, pdf);
-
-            NoL = max(dot(Ns, newDir), 0.0);
-            if (pdf <= 1e-8 || NoL <= 0.0) {
-                break;
+            float rrP = clamp(throughput, 0.05, 0.95);
+            if (bounce >= 2u) {
+                if (rand01(rng) > rrP) {
+                    lastBounce = bounce;
+                    break;
+                }
+                throughput /= rrP;
             }
 
-            f = evalBSDF(Ns, V, newDir, albedo, smoothness, metallic);
+            vec3 newDir;
+            bool wasSpecularEvent = false;
 
-            throughput *= f * NoL / max(pdf, 1e-8);
+            if (transmission > 0.001) {
+                vec3 Nd = Ns;
+                DielectricSample ds = sampleDielectricBSDF(Nd, V, frontFace, albedoS, smoothness, iorLambda, rng);
 
-            wasSpecularEvent = false;//isDeltaSpecular(smoothness); not correct for current bsdf sampling, we don't do pure specular sampling even for smoothness = 1.
+                float absNoL = abs(dot(Nd, ds.dir));
+                if (ds.pdf <= 1e-8 || absNoL <= 1e-8 || ds.f <= 1e-8) {
+                    lastBounce = bounce;
+                    break;
+                }
 
-            vec3 pushNg = dot(newDir, Ng) >= 0.0 ? Ng : -Ng;
-            ro = hitPos + pushNg * EPS + newDir * EPS;
-            rd = normalize(newDir);
+                throughput *= ds.f * absNoL / ds.pdf;
+
+                newDir = normalize(ds.dir);
+                wasSpecularEvent = (ds.isDelta != 0u);
+
+                vec3 pushNg = dot(newDir, Ng) >= 0.0 ? Ng : -Ng;
+                ro = hitPos + pushNg * EPS + newDir * EPS;
+                rd = newDir;
+            } else {
+                vec2 uSelect = vec2(rand01(rng), rand01(rng));
+                vec2 uDir    = vec2(rand01(rng), rand01(rng));
+
+                float pdf;
+                newDir = sampleBSDF(Ns, V, albedo, smoothness, metallic, uSelect, uDir, pdf);
+
+                float NoL = max(dot(Ns, newDir), 0.0);
+                if (pdf <= 1e-8 || NoL <= 0.0) {
+                    lastBounce = bounce;
+                    break;
+                }
+
+                float fS = evalBSDFScalar(Ns, V, newDir, albedoS, smoothness, metallic);
+                throughput *= fS * NoL / max(pdf, 1e-8);
+
+                wasSpecularEvent = false;
+
+                vec3 pushNg = dot(newDir, Ng) >= 0.0 ? Ng : -Ng;
+                ro = hitPos + pushNg * EPS + newDir * EPS;
+                rd = normalize(newDir);
+            }
+
+            prevWasSpecular = wasSpecularEvent;
+
+            lastRo = ro;
+            lastRd = rd;
+            lastThroughput = throughput;
+            lastLambda = lambda;
+            lastRadianceXYZ = radianceXYZ;
+            lastBounce = bounce + 1u;
         }
 
-        prevWasSpecular = wasSpecularEvent;
-        paths[pixelIndex].ro = vec4(ro, 0.0);
-        paths[pixelIndex].rd = vec4(rd, 0.0);
-        paths[pixelIndex].throughput = vec4(throughput, 0.0);
-        paths[pixelIndex].radiance = vec4(radiance, 0.0);
-        paths[pixelIndex].bounce = bounce + 1u;
+        totalRadianceXYZ += radianceXYZ;
     }
+
+    vec3 radianceXYZ = totalRadianceXYZ / float(LAMBDA_SPP);
+
+    paths[pixelIndex].ro = vec4(lastRo, 0.0);
+    paths[pixelIndex].rd = vec4(lastRd, 0.0);
+    paths[pixelIndex].throughput_lambda = vec4(lastThroughput, lastLambda, 0.0, 0.0);
+    paths[pixelIndex].radianceXYZ = vec4(radianceXYZ, 0.0);
+    paths[pixelIndex].pixelIndex = pixelIndex;
+    paths[pixelIndex].alive = 0u;
+    paths[pixelIndex].bounce = lastBounce;
 
     ivec2 ipix = ivec2(pix);
 
     vec4 prevAccum = imageLoad(accumImage, ipix);
     float frameIndex = float(frame.screen.w);
 
+    vec3 sampleRGB = xyz_to_linear_srgb(radianceXYZ);
+    sampleRGB /= whiteBalanceRGB();
+
     vec3 accumColor = (frame.screen.w == 0u)
-        ? clamp_rgb_luma(radiance, RGB_CLAMP)
-        : clamp_rgb_luma((prevAccum.xyz * frameIndex + radiance) / (frameIndex + 1.0), RGB_CLAMP);
+        ? clamp_rgb_luma(sampleRGB, RGB_CLAMP)
+        : clamp_rgb_luma((prevAccum.xyz * frameIndex + sampleRGB) / (frameIndex + 1.0), RGB_CLAMP);
 
     imageStore(accumImage, ipix, vec4(accumColor, 1.0));
-    imageStore(outImage,   ipix, vec4(radiance, 1.0));
+    imageStore(outImage,   ipix, vec4(sampleRGB, 1.0));
 
-    paths[pixelIndex].radiance = vec4(radiance, 0.0);
+    paths[pixelIndex].radianceXYZ = vec4(radianceXYZ, 0.0);
+    paths[pixelIndex].throughput_lambda = vec4(lastThroughput, lastLambda, 0.0, 0.0);
     paths[pixelIndex].alive = 0u;
 }

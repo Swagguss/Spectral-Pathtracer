@@ -37,5 +37,11 @@
 *.out
 *.app
 
+# Visual Studio workspace state
+.vs/
+
+# Build outputs
+x64/
+
 # debug information files
 *.dwo

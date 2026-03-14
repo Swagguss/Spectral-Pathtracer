@@ -54,16 +54,16 @@ struct CameraState {
     float yaw = 0.0f;
     float pitch = 0.0f;
 
-    float moveSpeed = 0.0003f;
-    float rotSpeed = 0.001f;
+    float moveSpeed = 0.005f;
+    float rotSpeed = 0.01f;
     float fovY = 45.0f * 3.1415926535f / 180.0f;
 };
 
 struct GpuPathState {
     float ro[4];
     float rd[4];
-    float throughput[4];
-    float radiance[4];
+    float throughput_lambda[4];
+    float radianceXYZ[4];
     uint32_t pixelIndex;
     uint32_t alive;
     uint32_t bounce;
@@ -600,10 +600,7 @@ static VkSurfaceFormatKHR chooseSurfaceFormat(const std::vector<VkSurfaceFormatK
     return formats.at(0);
 }
 
-static VkPresentModeKHR choosePresentMode(const std::vector<VkPresentModeKHR>& modes) {
-    for (auto m : modes) {
-        if (m == VK_PRESENT_MODE_MAILBOX_KHR) return m;
-    }
+static VkPresentModeKHR choosePresentMode(const std::vector<VkPresentModeKHR>&) {
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
