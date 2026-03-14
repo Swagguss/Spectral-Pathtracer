@@ -1,0 +1,13 @@
+C:\Users\tromn\source\repos\Spectral Pathtracing\include\backends\imgui_impl_glfw.cpp;C:\Users\tromn\source\repos\Spectral Pathtracing\Spectral.d3e9b99b\x64\Debug\imgui_impl_glfw.obj
+C:\Users\tromn\source\repos\Spectral Pathtracing\include\backends\imgui_impl_vulkan.cpp;C:\Users\tromn\source\repos\Spectral Pathtracing\Spectral.d3e9b99b\x64\Debug\imgui_impl_vulkan.obj
+C:\Users\tromn\source\repos\Spectral Pathtracing\include\Volk\volk.c;C:\Users\tromn\source\repos\Spectral Pathtracing\Spectral.d3e9b99b\x64\Debug\volk.obj
+C:\Users\tromn\source\repos\Spectral Pathtracing\src\bvh.cpp;C:\Users\tromn\source\repos\Spectral Pathtracing\Spectral.d3e9b99b\x64\Debug\bvh.obj
+C:\Users\tromn\source\repos\Spectral Pathtracing\src\imgui.cpp;C:\Users\tromn\source\repos\Spectral Pathtracing\Spectral.d3e9b99b\x64\Debug\imgui.obj
+C:\Users\tromn\source\repos\Spectral Pathtracing\src\imgui_demo.cpp;C:\Users\tromn\source\repos\Spectral Pathtracing\Spectral.d3e9b99b\x64\Debug\imgui_demo.obj
+C:\Users\tromn\source\repos\Spectral Pathtracing\src\imgui_draw.cpp;C:\Users\tromn\source\repos\Spectral Pathtracing\Spectral.d3e9b99b\x64\Debug\imgui_draw.obj
+C:\Users\tromn\source\repos\Spectral Pathtracing\src\imgui_tables.cpp;C:\Users\tromn\source\repos\Spectral Pathtracing\Spectral.d3e9b99b\x64\Debug\imgui_tables.obj
+C:\Users\tromn\source\repos\Spectral Pathtracing\src\imgui_widgets.cpp;C:\Users\tromn\source\repos\Spectral Pathtracing\Spectral.d3e9b99b\x64\Debug\imgui_widgets.obj
+C:\Users\tromn\source\repos\Spectral Pathtracing\src\main.cpp;C:\Users\tromn\source\repos\Spectral Pathtracing\Spectral.d3e9b99b\x64\Debug\main.obj
+C:\Users\tromn\source\repos\Spectral Pathtracing\src\obj_loader.cpp;C:\Users\tromn\source\repos\Spectral Pathtracing\Spectral.d3e9b99b\x64\Debug\obj_loader.obj
+C:\Users\tromn\source\repos\Spectral Pathtracing\src\rt_accel.cpp;C:\Users\tromn\source\repos\Spectral Pathtracing\Spectral.d3e9b99b\x64\Debug\rt_accel.obj
+C:\Users\tromn\source\repos\Spectral Pathtracing\src\vma_impl.cpp;C:\Users\tromn\source\repos\Spectral Pathtracing\Spectral.d3e9b99b\x64\Debug\vma_impl.obj

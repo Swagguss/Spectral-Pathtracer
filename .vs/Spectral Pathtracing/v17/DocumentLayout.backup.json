@@ -1,0 +1,140 @@
+{
+  "Version": 1,
+  "WorkspaceRootPath": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\",
+  "Documents": [
+    {
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\wavefront_rt.comp||{8B382828-6202-11D1-8870-0000F87579D2}",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:Shared\\wavefront_rt.comp||{8B382828-6202-11D1-8870-0000F87579D2}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\main.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
+      "RelativeMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|solutionrelative:src\\main.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\bvh.h||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
+      "RelativeMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|solutionrelative:src\\bvh.h||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\obj_loader.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
+      "RelativeMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|solutionrelative:src\\obj_loader.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\bvh.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
+      "RelativeMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|solutionrelative:src\\bvh.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\rt_accel.h||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
+      "RelativeMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|solutionrelative:src\\rt_accel.h||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\obj_loader.h||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
+      "RelativeMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|solutionrelative:src\\obj_loader.h||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
+    }
+  ],
+  "DocumentGroupContainers": [
+    {
+      "Orientation": 0,
+      "VerticalTabListWidth": 256,
+      "DocumentGroups": [
+        {
+          "DockedWidth": 200,
+          "SelectedChildIndex": 5,
+          "Children": [
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{aa2115a1-9712-457b-9047-dbb71ca2cdd2}"
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 2,
+              "Title": "bvh.h",
+              "DocumentMoniker": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\bvh.h",
+              "RelativeDocumentMoniker": "src\\bvh.h",
+              "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\bvh.h",
+              "RelativeToolTip": "src\\bvh.h",
+              "ViewState": "AgIAABMAAAAAAAAAAAAgwBEAAAAXAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000680|",
+              "WhenOpened": "2026-03-13T03:29:54.392Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 5,
+              "Title": "rt_accel.h",
+              "DocumentMoniker": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\rt_accel.h",
+              "RelativeDocumentMoniker": "src\\rt_accel.h",
+              "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\rt_accel.h",
+              "RelativeToolTip": "src\\rt_accel.h",
+              "ViewState": "AgIAABsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000680|",
+              "WhenOpened": "2026-03-13T03:29:35.341Z"
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 6,
+              "Title": "obj_loader.h",
+              "DocumentMoniker": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\obj_loader.h",
+              "RelativeDocumentMoniker": "src\\obj_loader.h",
+              "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\obj_loader.h",
+              "RelativeToolTip": "src\\obj_loader.h",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000680|",
+              "WhenOpened": "2026-03-13T03:29:30.87Z"
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 3,
+              "Title": "obj_loader.cpp",
+              "DocumentMoniker": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\obj_loader.cpp",
+              "RelativeDocumentMoniker": "src\\obj_loader.cpp",
+              "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\obj_loader.cpp",
+              "RelativeToolTip": "src\\obj_loader.cpp",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
+              "WhenOpened": "2026-03-13T03:29:28.282Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 0,
+              "Title": "wavefront_rt.comp",
+              "DocumentMoniker": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\wavefront_rt.comp",
+              "RelativeDocumentMoniker": "Shared\\wavefront_rt.comp",
+              "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\wavefront_rt.comp",
+              "RelativeToolTip": "Shared\\wavefront_rt.comp",
+              "ViewState": "AgIAAOIAAAAAAAAAAAAhwPMAAAAZAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
+              "WhenOpened": "2026-03-13T03:20:50.502Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 4,
+              "Title": "bvh.cpp",
+              "DocumentMoniker": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\bvh.cpp",
+              "RelativeDocumentMoniker": "src\\bvh.cpp",
+              "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\bvh.cpp",
+              "RelativeToolTip": "src\\bvh.cpp",
+              "ViewState": "AgIAACkAAAAAAAAAAAAQwD4AAAAoAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
+              "WhenOpened": "2026-03-12T17:48:22.534Z"
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 1,
+              "Title": "main.cpp",
+              "DocumentMoniker": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\main.cpp",
+              "RelativeDocumentMoniker": "src\\main.cpp",
+              "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\main.cpp",
+              "RelativeToolTip": "src\\main.cpp",
+              "ViewState": "AgIAAEEIAAAAAAAAAAAQwFYIAAANAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
+              "WhenOpened": "2026-03-12T14:04:27.965Z",
+              "EditorCaption": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
