@@ -4,7 +4,7 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-const float RGB_CLAMP = 10.0;
+const float RGB_CLAMP = 1.0;
 const float PI = 3.14159265358979323846;
 const float EPS = 1e-4;
 const float INF_T = 1e30;
@@ -16,6 +16,10 @@ const float MNEE_PROB_MAX = 0.50;
 const float MNEE_EPS_UV    = 1e-4;
 const float MNEE_EPS_C     = 5e-4;
 const float MNEE_EPS_PIVOT = 1e-10;
+const float MNEE_GUIDE_SIGMA_FRAC = 0.08;   // fraction of triangle edge scale
+const float MNEE_GUIDE_MIN_SIGMA  = 1e-4;
+const float MNEE_GUIDE_MAX_SIGMA  = 0.25;
+const float MNEE_RAY_BIAS         = 5e-5;
 
 const uint EVT_REFRACT = 0u;
 const uint EVT_REFLECT = 1u;
@@ -123,6 +127,11 @@ layout(std430, binding = 10) readonly buffer NormalBuffer {
     float normalData[];
 };
 
+// Output textures for denoiser
+layout(binding = 11, rgba32f) uniform writeonly image2D albedoImage;
+layout(binding = 12, rgba32f) uniform writeonly image2D normalImage;
+layout(binding = 13, rgba32f) uniform writeonly image2D depthImage;
+
 vec3 loadNormal(uint vertexIndex) {
     uint base = vertexIndex * 3u;
     return vec3(
@@ -157,6 +166,65 @@ vec3 clamp_rgb_luma(vec3 color, float maxLuma) {
 float gauss1(float x, float mu, float sigma) {
     float t = (x - mu) / sigma;
     return exp(-0.5 * t * t);
+}
+
+float triangleArea(vec3 a, vec3 b, vec3 c) {
+    return 0.5 * length(cross(b - a, c - a));
+}
+
+float triangleEdgeScale(vec3 a, vec3 b, vec3 c) {
+    return max(max(length(b - a), length(c - b)), length(a - c));
+}
+
+vec3 faceforwardN(vec3 n, vec3 v) {
+    return dot(n, v) < 0.0 ? -n : n;
+}
+
+bool pointInTriangleBary(vec2 uv) {
+    float u = uv.x;
+    float v = uv.y;
+    float w = 1.0 - u - v;
+    return (u >= 0.0 && v >= 0.0 && w >= 0.0);
+}
+
+vec2 clampBaryToTriangle(vec2 uv) {
+    float u = uv.x;
+    float v = uv.y;
+    float w = 1.0 - u - v;
+
+    u = max(u, 0.0);
+    v = max(v, 0.0);
+    w = max(w, 0.0);
+
+    float s = u + v + w;
+    if (s <= 1e-8) {
+        return vec2(1.0 / 3.0, 1.0 / 3.0);
+    }
+
+    u /= s;
+    v /= s;
+    return vec2(u, v);
+}
+
+vec2 worldToTriangleBary(vec3 p, vec3 a, vec3 b, vec3 c) {
+    vec3 v0 = b - a;
+    vec3 v1 = c - a;
+    vec3 v2 = p - a;
+
+    float d00 = dot(v0, v0);
+    float d01 = dot(v0, v1);
+    float d11 = dot(v1, v1);
+    float d20 = dot(v2, v0);
+    float d21 = dot(v2, v1);
+
+    float denom = d00 * d11 - d01 * d01;
+    if (abs(denom) < 1e-12) {
+        return vec2(1.0 / 3.0, 1.0 / 3.0);
+    }
+
+    float u = (d11 * d20 - d01 * d21) / denom;
+    float v = (d00 * d21 - d01 * d20) / denom;
+    return vec2(u, v);
 }
 
 float rgb_to_spectrum_unit(float lambda, vec3 rgb) {
@@ -286,6 +354,28 @@ vec3 triNormalFlat(uint triIndex) {
     return triangleNormal(v0, v1, v2);
 }
 
+vec3 projectPointToTrianglePlane(vec3 p, vec3 a, vec3 b, vec3 c) {
+    vec3 n = triangleNormal(a, b, c);
+    float d = dot(p - a, n);
+    return p - d * n;
+}
+
+float gaussian2Pdf(vec2 x, float sigma) {
+    float r2 = dot(x, x);
+    float s2 = sigma * sigma;
+    return exp(-0.5 * r2 / max(s2, 1e-12)) / max(2.0 * PI * s2, 1e-12);
+}
+
+vec2 sampleGaussian2(inout uint rng, float sigma) {
+    float u1 = max(rand01(rng), 1e-8);
+    float u2 = rand01(rng);
+
+    float r = sigma * sqrt(-2.0 * log(u1));
+    float phi = 2.0 * PI * u2;
+
+    return vec2(r * cos(phi), r * sin(phi));
+}
+
 vec2 sampleUniformTriangle(vec2 u) {
     float su0 = sqrt(u.x);
     return vec2(1.0 - su0, u.y * su0);
@@ -391,7 +481,7 @@ float luminance(vec3 c) {
 }
 
 float roughnessFromSmoothness(float smoothness) {
-    return max(0.001, 1.0 - clamp(smoothness, 0.0, 1.0));
+    return max(0.02, 1.0 - clamp(smoothness, 0.0, 1.0));
 }
 
 float alphaFromSmoothness(float smoothness) {
@@ -400,11 +490,15 @@ float alphaFromSmoothness(float smoothness) {
 }
 
 bool isDeltaSpecular(float smoothness) {
-    return smoothness > 0.999;
+    return smoothness > 0.98;
 }
 
 bool isDeltaTransmission(float transmission) {
     return transmission > 0.001;
+}
+
+bool isOpaqueDeltaSpecular(float transmission, float metallic, float smoothness) {
+    return transmission <= 0.001 && metallic > 0.999 && smoothness > 0.98;
 }
 
 bool isMneeSpecular(uint triIndex) {
@@ -987,14 +1081,18 @@ vec2 specConstraintReflect(
         return vec2(0.0);
     }
 
-    vec3 wi = wiVec * inversesqrt(wiLen2); // away from vertex toward previous point
-    vec3 wo = woVec * inversesqrt(woLen2); // away from vertex toward next point
+    vec3 wi = wiVec * inversesqrt(wiLen2);
+    vec3 wo = woVec * inversesqrt(woLen2);
 
     vec3 n = triNormalFlat(triIndex);
+    vec3 incident = -wi;
+    if (dot(incident, n) > 0.0) {
+        n = -n;
+    }
+
     vec3 T, B;
     makeBasis(n, T, B);
 
-    // Reflection manifold: wi + wo must be normal-aligned.
     vec3 r = wi + wo;
     return vec2(dot(r, T), dot(r, B));
 }
@@ -1004,11 +1102,10 @@ vec2 specConstraintRefract(
     vec3 thisP,
     vec3 nextP,
     uint triIndex,
-    float etaI,
-    float etaT
+    float etaMat
 ) {
-    vec3 wiVec = prevP - thisP;
-    vec3 woVec = nextP - thisP;
+    vec3 wiVec = prevP - thisP; // from vertex toward previous point
+    vec3 woVec = nextP - thisP; // from vertex toward next point
 
     float wiLen2 = dot(wiVec, wiVec);
     float woLen2 = dot(woVec, woVec);
@@ -1016,14 +1113,28 @@ vec2 specConstraintRefract(
         return vec2(0.0);
     }
 
-    vec3 wi = wiVec * inversesqrt(wiLen2); // away from vertex toward previous point
-    vec3 wo = woVec * inversesqrt(woLen2); // away from vertex toward next point
+    vec3 wi = wiVec * inversesqrt(wiLen2);
+    vec3 wo = woVec * inversesqrt(woLen2);
 
     vec3 n = triNormalFlat(triIndex);
+
+    // Orient normal so wi is incident from the outside.
+    // wi points away from the vertex toward the previous point, so -wi is the
+    // physical incoming direction toward the surface.
+    vec3 incident = -wi;
+    bool entering = dot(incident, n) < 0.0;
+    if (!entering) {
+        n = -n;
+    }
+
+    float etaI = entering ? 1.0    : etaMat;
+    float etaT = entering ? etaMat : 1.0;
+
     vec3 T, B;
     makeBasis(n, T, B);
 
-    // Refraction manifold: etaI * wi + etaT * wo must be normal-aligned.
+    // Tangential Snell constraint:
+    // etaI * wi_t + etaT * wo_t = 0
     vec3 r = etaI * wi + etaT * wo;
     return vec2(dot(r, T), dot(r, B));
 }
@@ -1334,14 +1445,12 @@ void mneeConstraints(
     if (count > 1u) x[1] = triPointBaryUnclamped(seed.tri[1], seed.uv[1].x, seed.uv[1].y);
     if (count > 2u) x[2] = triPointBaryUnclamped(seed.tri[2], seed.uv[2].x, seed.uv[2].y);
 
-    float etaFrom = 1.0;
-
     for (uint i = 0u; i < count; ++i) {
         vec3 prevP = (i > 0u) ? x[i - 1u] : x0;
         vec3 thisP = x[i];
         vec3 nextP = ((i + 1u) < count) ? x[i + 1u] : y;
 
-        vec2 c;
+        vec2 c = vec2(0.0);
 
         if (seed.evt[i] == EVT_REFLECT) {
             c = specConstraintReflect(prevP, thisP, nextP, seed.tri[i]);
@@ -1354,14 +1463,121 @@ void mneeConstraints(
                 lambda
             );
 
-            float etaTo = (etaFrom == 1.0) ? etaMat : 1.0;
-            c = specConstraintRefract(prevP, thisP, nextP, seed.tri[i], etaFrom, etaTo);
-            etaFrom = etaTo;
+            c = specConstraintRefract(prevP, thisP, nextP, seed.tri[i], etaMat);
         }
 
         C[2u * i + 0u] = c.x;
         C[2u * i + 1u] = c.y;
     }
+}
+
+bool predictCausticLightPoint(
+    vec3 x0,
+    MneeSeed seed,
+    float lambda,
+    uint lightTri,
+    out vec3 yPred
+) {
+    if (seed.count == 0u) return false;
+
+    vec3 x[3];
+    x[0] = triPointBaryUnclamped(seed.tri[0], seed.uv[0].x, seed.uv[0].y);
+    if (seed.count > 1u) x[1] = triPointBaryUnclamped(seed.tri[1], seed.uv[1].x, seed.uv[1].y);
+    if (seed.count > 2u) x[2] = triPointBaryUnclamped(seed.tri[2], seed.uv[2].x, seed.uv[2].y);
+
+    vec3 curr = x0;
+    vec3 dir = normalize(x[0] - x0);
+
+    for (uint i = 0u; i < seed.count; ++i) {
+        uint triS = seed.tri[i];
+        uint matIndex = triangleMaterialIndices[triS];
+        Material matS = materials[matIndex];
+
+        vec3 hitP = x[i];
+        vec3 n = triNormalFlat(triS);
+
+        if (seed.evt[i] == EVT_REFLECT) {
+            if (dot(dir, n) > 0.0) n = -n;
+            dir = reflect(dir, n);
+        } else {
+            float etaMat = iorAtLambda(
+                matS.metallic_smoothShading_transmission_ior.w,
+                matS.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x,
+                lambda
+            );
+
+            bool entering = dot(dir, n) < 0.0;
+            if (!entering) n = -n;
+
+            float etaI = entering ? 1.0    : etaMat;
+            float etaT = entering ? etaMat : 1.0;
+
+            vec3 tdir;
+            if (!refractDir(dir, n, etaI / etaT, tdir)) {
+                dir = reflect(dir, n);
+            } else {
+                dir = tdir;
+            }
+        }
+
+        curr = hitP + dir * MNEE_RAY_BIAS;
+    }
+
+    vec3 a, b, c;
+    loadTriangle(lightTri, a, b, c);
+    vec3 nL = triangleNormal(a, b, c);
+
+    float denom = dot(dir, nL);
+    if (abs(denom) < 1e-8) return false;
+
+    float t = dot(a - curr, nL) / denom;
+    if (t <= 0.0) return false;
+
+    vec3 p = curr + dir * t;
+    vec2 uv = worldToTriangleBary(p, a, b, c);
+    uv = clampBaryToTriangle(uv);
+    yPred = triPointBaryUnclamped(lightTri, uv.x, uv.y);
+    return true;
+}
+
+bool sampleLightNearPredictedPoint(
+    uint lightTri,
+    vec3 yPred,
+    inout uint rng,
+    out vec3 y,
+    out float pdfArea
+) {
+    vec3 a, b, c;
+    loadTriangle(lightTri, a, b, c);
+
+    vec3 nL = triangleNormal(a, b, c);
+    vec3 T, B;
+    makeBasis(nL, T, B);
+
+    float edgeScale = triangleEdgeScale(a, b, c);
+    float sigma = clamp(edgeScale * MNEE_GUIDE_SIGMA_FRAC, MNEE_GUIDE_MIN_SIGMA, MNEE_GUIDE_MAX_SIGMA);
+
+    vec2 g = sampleGaussian2(rng, sigma);
+    vec3 p = yPred + T * g.x + B * g.y;
+    p = projectPointToTrianglePlane(p, a, b, c);
+
+    vec2 uv = worldToTriangleBary(p, a, b, c);
+    uv = clampBaryToTriangle(uv);
+    y = triPointBaryUnclamped(lightTri, uv.x, uv.y);
+
+    vec2 uvPred = worldToTriangleBary(yPred, a, b, c);
+    uvPred = clampBaryToTriangle(uvPred);
+    vec3 yCenter = triPointBaryUnclamped(lightTri, uvPred.x, uvPred.y);
+
+    vec3 d = y - yCenter;
+    vec2 local = vec2(dot(d, T), dot(d, B));
+
+    float area = max(triangleArea(a, b, c), 1e-8);
+    float pGauss = gaussian2Pdf(local, sigma);
+
+    // Approximate truncated Gaussian on triangle by renormalizing weakly with uniform fallback.
+    pdfArea = max(0.9 * pGauss + 0.1 * (1.0 / area), 1e-8);
+    return true;
 }
 
 float maxAbsConstraints(uint count, float C[6]) {
@@ -1561,13 +1777,33 @@ float mneeAreaCaustic(
     float lightArea = emissiveTriangles[lightSlot].area_pmf_cdf_pad.x;
     float lightPmf  = emissiveTriangles[lightSlot].area_pmf_cdf_pad.y;
 
+    if (lightArea <= 0.0 || lightPmf <= 0.0) return 0.0;
+
+    // Build a provisional seed first. We still need a light point to do that,
+    // so use the emitter centroid as a weak initial target.
     vec3 lv0, lv1, lv2;
     loadTriangle(triL, lv0, lv1, lv2);
+    vec3 yInit = (lv0 + lv1 + lv2) / 3.0;
 
-    vec2 su = vec2(rand01(rng), rand01(rng));
-    vec2 sb = sampleUniformTriangle(su);
-    float bw = 1.0 - sb.x - sb.y;
-    vec3 y = bw * lv0 + sb.x * lv1 + sb.y * lv2;
+    MneeSeed seedChain = buildMneeSeed(x0, n0, yInit, lambda);
+    if (seedChain.count == 0u) return 0.0;
+
+    // Predict where the caustic should hit the chosen emitter for this wavelength.
+    vec3 yPred;
+    if (!predictCausticLightPoint(x0, seedChain, lambda, triL, yPred)) {
+        return 0.0;
+    }
+
+    // Guided sampling around predicted point.
+    vec3 y;
+    float pdfGuideArea;
+    if (!sampleLightNearPredictedPoint(triL, yPred, rng, y, pdfGuideArea)) {
+        return 0.0;
+    }
+
+    // Include light selection PMF.
+    float pdfArea = lightPmf * pdfGuideArea;
+    if (pdfArea <= 0.0) return 0.0;
 
     vec3 lightN = triangleNormal(lv0, lv1, lv2);
 
@@ -1581,13 +1817,10 @@ float mneeAreaCaustic(
     float cosAtLight0 = max(dot(lightN, -wi0), 0.0);
     if (cosAtLight0 <= 1e-8) return 0.0;
 
-    float pdfW = (lightPmf / max(lightArea, 1e-8)) * dist2_0 / max(cosAtLight0, 1e-8);
-    float pdfA = lightPmf / max(lightArea, 1e-8);
-    if (pdfW <= 0.0 || pdfA <= 0.0) return 0.0;
+    float pdfW = pdfArea * dist2_0 / max(cosAtLight0, 1e-8);
+    if (pdfW <= 0.0) return 0.0;
 
-    MneeSeed seedChain = buildMneeSeed(x0, n0, y, lambda);
-    if (seedChain.count == 0u) return 0.0;
-
+    // Now solve manifold for actual sampled light point.
     MneeSolve sol = mneeNewtonSolve(x0, y, lambda, seedChain);
     if (!sol.ok || sol.invAbsDetJ <= 0.0) return 0.0;
 
@@ -1609,8 +1842,6 @@ float mneeAreaCaustic(
     if (f0 <= 0.0) return 0.0;
 
     float specW = 1.0;
-    float etaFrom = 1.0;
-    float TrGlass = 1.0;
 
     for (uint i = 0u; i < count; ++i) {
         uint triS = sol.seed.tri[i];
@@ -1636,13 +1867,10 @@ float mneeAreaCaustic(
         vec3 n = triNormalFlat(triS);
 
         if (sol.seed.evt[i] == EVT_REFLECT) {
-            float etaI = etaFrom;
-            float etaT = (etaFrom != 1.0) ? 1.0 : etaMat;
+            if (dot(wi, n) > 0.0) n = -n;
 
-            if (dot(wi, n) > 0.0) {
-                n = -n;
-                float tmp = etaI; etaI = etaT; etaT = tmp;
-            }
+            float etaI = etaMat;
+            float etaT = 1.0;
 
             vec3 tdir;
             bool hasTransmit = refractDir(wi, n, etaI / etaT, tdir);
@@ -1655,22 +1883,17 @@ float mneeAreaCaustic(
                 specW *= F * surfTintR;
             }
         } else {
-            float etaTo = (etaFrom == 1.0) ? etaMat : 1.0;
-            float etaI = etaFrom;
-            float etaT = etaTo;
+            bool entering = dot(wi, n) < 0.0;
+            if (!entering) n = -n;
 
-            if (dot(wi, n) > 0.0) {
-                n = -n;
-                float tmp = etaI; etaI = etaT; etaT = tmp;
-            }
+            float etaI = entering ? 1.0    : etaMat;
+            float etaT = entering ? etaMat : 1.0;
 
             float cosI = abs(dot(wi, n));
             float F = fresnelDielectric(cosI, etaI, etaT);
 
             specW *= tr * (1.0 - F) * surfTintT;
             specW *= (etaI * etaI) / max(etaT * etaT, 1e-8);
-
-            etaFrom = etaTo;
         }
 
         if (specW <= 0.0) return 0.0;
@@ -1689,8 +1912,9 @@ float mneeAreaCaustic(
         vec3 curr = x[i];
         vec3 d = curr - prev;
         float d2 = dot(d, d);
-        vec3 w = normalize(d);
+        if (d2 <= 1e-12) return 0.0;
 
+        vec3 w = normalize(d);
         vec3 currN = triNormalFlat(sol.seed.tri[i]);
 
         float cosA = abs(dot(prevN, w));
@@ -1703,8 +1927,11 @@ float mneeAreaCaustic(
 
     vec3 toL = y - xLast;
     float dist2 = dot(toL, toL);
-    vec3 wiL = toL * inversesqrt(max(dist2, 1e-8));
+    if (dist2 <= 1e-12) return 0.0;
+
+    vec3 wiL = toL * inversesqrt(dist2);
     float cosL = max(dot(lightN, -wiL), 0.0);
+    if (cosL <= 1e-8) return 0.0;
 
     float contrib =
         Gprod *
@@ -1713,7 +1940,7 @@ float mneeAreaCaustic(
         specW *
         sol.invAbsDetJ *
         (cosL / max(dist2, 1e-8)) /
-        max(pdfA, 1e-8);
+        max(pdfArea, 1e-8);
 
     return max(contrib, 0.0);
 }
@@ -1775,6 +2002,11 @@ void main() {
             float tHit;
             vec2 bary;
             if (!traceClosest(ro, rd, prim, tHit, bary)) {
+                if (bounce == 0u) {
+                    imageStore(albedoImage, ivec2(pix), vec4(0.0, 0.0, 0.0, 1.0));
+                    imageStore(normalImage, ivec2(pix), vec4(0.5, 0.5, 1.0, 1.0));
+                    imageStore(depthImage, ivec2(pix), vec4(1e30, 0.0, 0.0, 1.0));
+                }
                 break;
             }
 
@@ -1830,6 +2062,13 @@ void main() {
             }
 
             vec3 V = normalize(-rd);
+
+            // Store to output textures for denoising
+            if (bounce == 0u) {
+                imageStore(albedoImage, ivec2(pix), vec4(albedo, 1.0));
+                imageStore(normalImage, ivec2(pix), vec4(Ns, 1.0));
+                imageStore(depthImage, ivec2(pix), vec4(tHit, 0.0, 0.0, 1.0));
+            }
 
             // Area-light NEE for opaque branch
             if (frame.extra.x > 0u && transmission <= 0.001) {
@@ -1891,7 +2130,7 @@ void main() {
                 if (pMnee > 0.0 && rand01(rng) < pMnee) {
                     float sum = 0.0;
                     for (uint s = 0u; s < MNEE_SPP; ++s) {
-                        sum += 0.0000003 * mneeAreaCaustic(
+                        sum += 0.00000001 * mneeAreaCaustic(
                             hitPos,
                             Ns,
                             V,
@@ -1938,6 +2177,18 @@ void main() {
                 vec3 pushNg = dot(newDir, Ng) >= 0.0 ? Ng : -Ng;
                 ro = hitPos + pushNg * EPS + newDir * EPS;
                 rd = newDir;
+            } else if (isOpaqueDeltaSpecular(transmission, metallic, smoothness)) {
+                vec3 R = reflect(-V, Ns);
+
+                float F0 = mix(0.04, albedoS, metallic);
+                float F = fresnelSchlickScalar(saturate(dot(Ns, V)), F0);
+
+                throughput *= F;
+                wasSpecularEvent = true;
+
+                vec3 pushNg = dot(R, Ng) >= 0.0 ? Ng : -Ng;
+                ro = hitPos + pushNg * EPS + R * EPS;
+                rd = normalize(R);
             } else {
                 vec2 uSelect = vec2(rand01(rng), rand01(rng));
                 vec2 uDir    = vec2(rand01(rng), rand01(rng));

@@ -38,6 +38,11 @@ struct RenderSettings {
     bool accumulate = true;
 };
 
+struct DenoiseParams {
+    int imageSize_step[4];   // width, height, stepRadius, unused
+    float sigma[4];          // colorSigma, normalSigma, depthSigma, albedoSigma
+};
+
 struct CameraUBO {
     float camPos[4];
     float camForward[4];
@@ -152,8 +157,8 @@ static bool drawMaterialEditor(MeshData& mesh, int& selectedMaterial) {
     changed |= ImGui::SliderFloat("Transmission", &m.metallic_smoothShading_transmission_ior[2], 0.0f, 1.0f);
     changed |= ImGui::SliderFloat("IOR", &m.metallic_smoothShading_transmission_ior[3], 1.0f, 3.0f);
 
-    changed |= ImGui::SliderFloat("Dispersion", &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[0], 0.0f, 2.0f);
-    changed |= ImGui::SliderFloat("Thin Film Thickness", &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[1], 0.0f, 2000.0f);
+    changed |= ImGui::SliderFloat("Dispersion", &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[0], 0.0f, 1.0f);
+    changed |= ImGui::SliderFloat("Thin Film Thickness", &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[1], 0.0f, 1000.0f);
     changed |= ImGui::SliderFloat("Thin Film IOR", &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[2], 1.0f, 3.0f);
     changed |= ImGui::SliderFloat("Thin Film Substrate Eta", &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[3], 1.0f, 5.0f);
 
@@ -1107,6 +1112,22 @@ int main() {
         VmaAllocation accumImageAlloc = VK_NULL_HANDLE;
         VkImageView accumImageView = VK_NULL_HANDLE;
 
+        VkImage albedoImage = VK_NULL_HANDLE;
+        VmaAllocation albedoImageAlloc = VK_NULL_HANDLE;
+        VkImageView albedoImageView = VK_NULL_HANDLE;
+
+        VkImage normalImage = VK_NULL_HANDLE;
+        VmaAllocation normalImageAlloc = VK_NULL_HANDLE;
+        VkImageView normalImageView = VK_NULL_HANDLE;
+
+        VkImage depthGuideImage = VK_NULL_HANDLE;
+        VmaAllocation depthGuideImageAlloc = VK_NULL_HANDLE;
+        VkImageView depthGuideImageView = VK_NULL_HANDLE;
+
+        VkImage denoisedImage = VK_NULL_HANDLE;
+        VmaAllocation denoisedImageAlloc = VK_NULL_HANDLE;
+        VkImageView denoisedImageView = VK_NULL_HANDLE;
+
         auto createStorageImage = [&](VkImage& image, VmaAllocation& alloc, VkImageView& view, const char* debugName) {
             VkImageCreateInfo ici{};
             ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -1149,6 +1170,11 @@ int main() {
         createStorageImage(tracedImage, tracedImageAlloc, tracedImageView, "tracedImage");
         createStorageImage(accumImage, accumImageAlloc, accumImageView, "accumImage");
 
+        createStorageImage(albedoImage, albedoImageAlloc, albedoImageView, "albedoImage");
+        createStorageImage(normalImage, normalImageAlloc, normalImageView, "normalImage");
+        createStorageImage(depthGuideImage, depthGuideImageAlloc, depthGuideImageView, "depthGuideImage");
+        createStorageImage(denoisedImage, denoisedImageAlloc, denoisedImageView, "denoisedImage");
+
         VkSampler presentSampler = VK_NULL_HANDLE;
         {
             VkSamplerCreateInfo sci{};
@@ -1185,7 +1211,7 @@ int main() {
 
         VkDescriptorSetLayout computeSetLayout = VK_NULL_HANDLE;
         {
-            std::array<VkDescriptorSetLayoutBinding, 11> bindings{};
+            std::array<VkDescriptorSetLayoutBinding, 14> bindings{};
 
             bindings[0].binding = 0;
             bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -1242,6 +1268,21 @@ int main() {
             bindings[10].descriptorCount = 1;
             bindings[10].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+            bindings[11].binding = 11;
+            bindings[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[11].descriptorCount = 1;
+            bindings[11].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            bindings[12].binding = 12;
+            bindings[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[12].descriptorCount = 1;
+            bindings[12].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            bindings[13].binding = 13;
+            bindings[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[13].descriptorCount = 1;
+            bindings[13].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
             VkDescriptorSetLayoutCreateInfo ci{};
             ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
             ci.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -1271,6 +1312,32 @@ int main() {
             }
         }
 
+        VkDescriptorSetLayout denoiseSetLayout = VK_NULL_HANDLE;
+        {
+            std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
+
+            for (uint32_t i = 0; i < 5; ++i) {
+                bindings[i].binding = i;
+                bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                bindings[i].descriptorCount = 1;
+                bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            }
+
+            bindings[5].binding = 5;
+            bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            bindings[5].descriptorCount = 1;
+            bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            VkDescriptorSetLayoutCreateInfo ci{};
+            ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            ci.bindingCount = static_cast<uint32_t>(bindings.size());
+            ci.pBindings = bindings.data();
+
+            if (vkCreateDescriptorSetLayout(device, &ci, nullptr, &denoiseSetLayout) != VK_SUCCESS) {
+                throw std::runtime_error("vkCreateDescriptorSetLayout(denoise) failed");
+            }
+        }
+
         VkPipelineLayout computePipelineLayout = VK_NULL_HANDLE;
         {
             VkPipelineLayoutCreateInfo ci{};
@@ -1292,6 +1359,18 @@ int main() {
 
             if (vkCreatePipelineLayout(device, &ci, nullptr, &presentPipelineLayout) != VK_SUCCESS) {
                 throw std::runtime_error("vkCreatePipelineLayout(present) failed");
+            }
+        }
+
+        VkPipelineLayout denoisePipelineLayout = VK_NULL_HANDLE;
+        {
+            VkPipelineLayoutCreateInfo ci{};
+            ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            ci.setLayoutCount = 1;
+            ci.pSetLayouts = &denoiseSetLayout;
+
+            if (vkCreatePipelineLayout(device, &ci, nullptr, &denoisePipelineLayout) != VK_SUCCESS) {
+                throw std::runtime_error("vkCreatePipelineLayout(denoise) failed");
             }
         }
 
@@ -1447,6 +1526,22 @@ int main() {
             throw std::runtime_error("vkCreateComputePipelines failed");
         }
 
+        const auto denoiseCode = readSpvFile("Shared/denoise.comp.spv");
+        VkShaderModule denoiseModule = createShaderModule(device, denoiseCode);
+
+        VkComputePipelineCreateInfo denoiseCI{};
+        denoiseCI.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        denoiseCI.layout = denoisePipelineLayout;
+        denoiseCI.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        denoiseCI.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        denoiseCI.stage.module = denoiseModule;
+        denoiseCI.stage.pName = "main";
+
+        VkPipeline denoisePipeline = VK_NULL_HANDLE;
+        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &denoiseCI, nullptr, &denoisePipeline) != VK_SUCCESS) {
+            throw std::runtime_error("vkCreateComputePipelines(denoise) failed");
+        }
+
         VkGraphicsPipelineCreateInfo gpci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
         gpci.stageCount = 2;
         gpci.pStages = shaderStages;
@@ -1518,6 +1613,16 @@ int main() {
         rtCtx.graphicsQueue = graphicsQueue;
         rtCtx.scratchAlignment = asProps.minAccelerationStructureScratchOffsetAlignment;
 
+        DenoiseParams dp{};
+        dp.imageSize_step[0] = static_cast<int>(extent.width);
+        dp.imageSize_step[1] = static_cast<int>(extent.height);
+        dp.imageSize_step[2] = 1; // step radius
+
+        dp.sigma[0] = 0.15f; // color
+        dp.sigma[1] = 0.10f; // normal
+        dp.sigma[2] = 0.02f; // depth
+        dp.sigma[3] = 0.10f; // albedo
+
         AllocatedBuffer pathBuffer = createBuffer(
             rtCtx,
             sizeof(GpuPathState) * extent.width * extent.height,
@@ -1528,6 +1633,15 @@ int main() {
         AllocatedBuffer frameParamsBuffer = createBuffer(
             rtCtx,
             sizeof(FrameParams),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+            VMA_ALLOCATION_CREATE_MAPPED_BIT
+        );
+
+        AllocatedBuffer denoiseParamsBuffer = createBuffer(
+            rtCtx,
+            sizeof(DenoiseParams),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
             VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
@@ -1635,13 +1749,13 @@ int main() {
 
         std::array<VkDescriptorPoolSize, 5> poolSizes{};
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        poolSizes[0].descriptorCount = 1;
+        poolSizes[0].descriptorCount = 2;
 
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         poolSizes[1].descriptorCount = 7;
 
         poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        poolSizes[2].descriptorCount = 2;
+        poolSizes[2].descriptorCount = 10;
 
         poolSizes[3].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         poolSizes[3].descriptorCount = 1;
@@ -1651,7 +1765,7 @@ int main() {
 
         VkDescriptorPoolCreateInfo poolCI{};
         poolCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolCI.maxSets = 2;
+        poolCI.maxSets = 3;
         poolCI.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
         poolCI.pPoolSizes = poolSizes.data();
 
@@ -1689,12 +1803,24 @@ int main() {
             accumStorageImageInfo.imageView = accumImageView;
             accumStorageImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
+            VkDescriptorImageInfo albedoStorageImageInfo{};
+            albedoStorageImageInfo.imageView = albedoImageView;
+            albedoStorageImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkDescriptorImageInfo normalStorageImageInfo{};
+            normalStorageImageInfo.imageView = normalImageView;
+            normalStorageImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkDescriptorImageInfo depthStorageImageInfo{};
+            depthStorageImageInfo.imageView = depthGuideImageView;
+            depthStorageImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
             VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
             asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
             asInfo.accelerationStructureCount = 1;
             asInfo.pAccelerationStructures = &tlas.handle;
 
-            std::array<VkWriteDescriptorSet, 11> writes{};
+            std::array<VkWriteDescriptorSet, 14> writes{};
 
             writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
             writes[0].dstSet = computeSet;
@@ -1773,7 +1899,130 @@ int main() {
             writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[10].pBufferInfo = &normalInfo;
 
+            writes[11] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            writes[11].dstSet = computeSet;
+            writes[11].dstBinding = 11;
+            writes[11].descriptorCount = 1;
+            writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[11].pImageInfo = &albedoStorageImageInfo;
+
+            writes[12] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            writes[12].dstSet = computeSet;
+            writes[12].dstBinding = 12;
+            writes[12].descriptorCount = 1;
+            writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[12].pImageInfo = &normalStorageImageInfo;
+
+            writes[13] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            writes[13].dstSet = computeSet;
+            writes[13].dstBinding = 13;
+            writes[13].descriptorCount = 1;
+            writes[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[13].pImageInfo = &depthStorageImageInfo;
+
             vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        }
+
+        VkDescriptorSet denoiseSet = VK_NULL_HANDLE;
+        {
+            VkDescriptorSetAllocateInfo ai{};
+            ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            ai.descriptorPool = descriptorPool;
+            ai.descriptorSetCount = 1;
+            ai.pSetLayouts = &denoiseSetLayout;
+
+            if (vkAllocateDescriptorSets(device, &ai, &denoiseSet) != VK_SUCCESS) {
+                throw std::runtime_error("vkAllocateDescriptorSets(denoiseSet) failed");
+            }
+
+            VkDescriptorImageInfo accumInfo{};
+            accumInfo.imageView = accumImageView;
+            accumInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkDescriptorImageInfo albedoInfo{};
+            albedoInfo.imageView = albedoImageView;
+            albedoInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkDescriptorImageInfo normalInfo{};
+            normalInfo.imageView = normalImageView;
+            normalInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkDescriptorImageInfo depthInfo{};
+            depthInfo.imageView = depthGuideImageView;
+            depthInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkDescriptorImageInfo denoisedInfo{};
+            denoisedInfo.imageView = denoisedImageView;
+            denoisedInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkDescriptorBufferInfo denoiseParamsInfo{};
+            denoiseParamsInfo.buffer = denoiseParamsBuffer.buffer;
+            denoiseParamsInfo.offset = 0;
+            denoiseParamsInfo.range = sizeof(DenoiseParams);
+
+            std::array<VkWriteDescriptorSet, 6> writes{};
+
+            writes[0] = {};
+            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[0].dstSet = denoiseSet;
+            writes[0].dstBinding = 0;
+            writes[0].dstArrayElement = 0;
+            writes[0].descriptorCount = 1;
+            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[0].pImageInfo = &accumInfo;
+
+            writes[1] = {};
+            writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[1].dstSet = denoiseSet;
+            writes[1].dstBinding = 1;
+            writes[1].dstArrayElement = 0;
+            writes[1].descriptorCount = 1;
+            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[1].pImageInfo = &albedoInfo;
+
+            writes[2] = {};
+            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[2].dstSet = denoiseSet;
+            writes[2].dstBinding = 2;
+            writes[2].dstArrayElement = 0;
+            writes[2].descriptorCount = 1;
+            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[2].pImageInfo = &normalInfo;
+
+            writes[3] = {};
+            writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[3].dstSet = denoiseSet;
+            writes[3].dstBinding = 3;
+            writes[3].dstArrayElement = 0;
+            writes[3].descriptorCount = 1;
+            writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[3].pImageInfo = &depthInfo;
+
+            writes[4] = {};
+            writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[4].dstSet = denoiseSet;
+            writes[4].dstBinding = 4;
+            writes[4].dstArrayElement = 0;
+            writes[4].descriptorCount = 1;
+            writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[4].pImageInfo = &denoisedInfo;
+
+            writes[5] = {};
+            writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[5].dstSet = denoiseSet;
+            writes[5].dstBinding = 5;
+            writes[5].dstArrayElement = 0;
+            writes[5].descriptorCount = 1;
+            writes[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            writes[5].pBufferInfo = &denoiseParamsInfo;
+
+            vkUpdateDescriptorSets(
+                device,
+                static_cast<uint32_t>(writes.size()),
+                writes.data(),
+                0,
+                nullptr
+            );
         }
 
         VkDescriptorSet presentSet = VK_NULL_HANDLE;
@@ -1790,7 +2039,7 @@ int main() {
 
             VkDescriptorImageInfo sampledImageInfo{};
             sampledImageInfo.sampler = presentSampler;
-            sampledImageInfo.imageView = accumImageView;
+            sampledImageInfo.imageView = denoisedImageView;
             sampledImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
             VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
@@ -1934,6 +2183,9 @@ int main() {
             std::memcpy(frameParamsBuffer.allocInfo.pMappedData, &fp, sizeof(fp));
             vmaFlushAllocation(allocator, frameParamsBuffer.allocation, 0, sizeof(fp));
 
+            std::memcpy(denoiseParamsBuffer.allocInfo.pMappedData, &dp, sizeof(dp));
+            vmaFlushAllocation(allocator, denoiseParamsBuffer.allocation, 0, sizeof(dp));
+
             vkWaitForFences(device, 1, &inFlight, VK_TRUE, UINT64_MAX);
             vkResetFences(device, 1, &inFlight);
 
@@ -1957,7 +2209,7 @@ int main() {
             tracedToGeneral.oldLayout =
                 (accumulationFrameIndex == 0)
                 ? VK_IMAGE_LAYOUT_UNDEFINED
-                : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                : VK_IMAGE_LAYOUT_GENERAL;
             tracedToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             tracedToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             tracedToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1975,7 +2227,7 @@ int main() {
             accumToGeneral.oldLayout =
                 (accumulationFrameIndex == 0)
                 ? VK_IMAGE_LAYOUT_UNDEFINED
-                : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                : VK_IMAGE_LAYOUT_GENERAL;
             accumToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             accumToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             accumToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1988,7 +2240,67 @@ int main() {
             accumToGeneral.srcAccessMask = 0;
             accumToGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 
-            VkImageMemoryBarrier toGeneralBarriers[] = { tracedToGeneral, accumToGeneral };
+            VkImageMemoryBarrier albedoToGeneral{};
+            albedoToGeneral.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            albedoToGeneral.oldLayout =
+                (accumulationFrameIndex == 0)
+                ? VK_IMAGE_LAYOUT_UNDEFINED
+                : VK_IMAGE_LAYOUT_GENERAL;
+            albedoToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            albedoToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            albedoToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            albedoToGeneral.image = albedoImage;
+            albedoToGeneral.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            albedoToGeneral.subresourceRange.baseMipLevel = 0;
+            albedoToGeneral.subresourceRange.levelCount = 1;
+            albedoToGeneral.subresourceRange.baseArrayLayer = 0;
+            albedoToGeneral.subresourceRange.layerCount = 1;
+            albedoToGeneral.srcAccessMask = 0;
+            albedoToGeneral.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+
+            VkImageMemoryBarrier normalToGeneral{};
+            normalToGeneral.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            normalToGeneral.oldLayout =
+                (accumulationFrameIndex == 0)
+                ? VK_IMAGE_LAYOUT_UNDEFINED
+                : VK_IMAGE_LAYOUT_GENERAL;
+            normalToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            normalToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            normalToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            normalToGeneral.image = normalImage;
+            normalToGeneral.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            normalToGeneral.subresourceRange.baseMipLevel = 0;
+            normalToGeneral.subresourceRange.levelCount = 1;
+            normalToGeneral.subresourceRange.baseArrayLayer = 0;
+            normalToGeneral.subresourceRange.layerCount = 1;
+            normalToGeneral.srcAccessMask = 0;
+            normalToGeneral.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+
+            VkImageMemoryBarrier depthToGeneral{};
+            depthToGeneral.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            depthToGeneral.oldLayout =
+                (accumulationFrameIndex == 0)
+                ? VK_IMAGE_LAYOUT_UNDEFINED
+                : VK_IMAGE_LAYOUT_GENERAL;
+            depthToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            depthToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            depthToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            depthToGeneral.image = depthGuideImage;
+            depthToGeneral.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            depthToGeneral.subresourceRange.baseMipLevel = 0;
+            depthToGeneral.subresourceRange.levelCount = 1;
+            depthToGeneral.subresourceRange.baseArrayLayer = 0;
+            depthToGeneral.subresourceRange.layerCount = 1;
+            depthToGeneral.srcAccessMask = 0;
+            depthToGeneral.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+
+            VkImageMemoryBarrier toGeneralBarriers[] = {
+                tracedToGeneral,
+                accumToGeneral,
+                albedoToGeneral,
+                normalToGeneral,
+                depthToGeneral
+            };
 
             vkCmdPipelineBarrier(
                 cmd,
@@ -1997,7 +2309,7 @@ int main() {
                 0,
                 0, nullptr,
                 0, nullptr,
-                2, toGeneralBarriers
+                5, toGeneralBarriers
             );
 
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
@@ -2013,47 +2325,110 @@ int main() {
             );
             vkCmdDispatch(cmd, (extent.width + 7) / 8, (extent.height + 7) / 8, 1);
 
-            VkImageMemoryBarrier tracedToSampled{};
-            tracedToSampled.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            tracedToSampled.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            tracedToSampled.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            tracedToSampled.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            tracedToSampled.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            tracedToSampled.image = tracedImage;
-            tracedToSampled.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            tracedToSampled.subresourceRange.baseMipLevel = 0;
-            tracedToSampled.subresourceRange.levelCount = 1;
-            tracedToSampled.subresourceRange.baseArrayLayer = 0;
-            tracedToSampled.subresourceRange.layerCount = 1;
-            tracedToSampled.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            tracedToSampled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            VkImageMemoryBarrier denoiseBarriers[5]{};
 
-            VkImageMemoryBarrier accumToSampled{};
-            accumToSampled.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            accumToSampled.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            accumToSampled.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            accumToSampled.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            accumToSampled.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            accumToSampled.image = accumImage;
-            accumToSampled.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            accumToSampled.subresourceRange.baseMipLevel = 0;
-            accumToSampled.subresourceRange.levelCount = 1;
-            accumToSampled.subresourceRange.baseArrayLayer = 0;
-            accumToSampled.subresourceRange.layerCount = 1;
-            accumToSampled.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            accumToSampled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            // accumImage: written by path tracer, read by denoiser
+            denoiseBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            denoiseBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            denoiseBarriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            denoiseBarriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            denoiseBarriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            denoiseBarriers[0].image = accumImage;
+            denoiseBarriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            denoiseBarriers[0].subresourceRange.baseMipLevel = 0;
+            denoiseBarriers[0].subresourceRange.levelCount = 1;
+            denoiseBarriers[0].subresourceRange.baseArrayLayer = 0;
+            denoiseBarriers[0].subresourceRange.layerCount = 1;
+            denoiseBarriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            denoiseBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
-            VkImageMemoryBarrier toSampledBarriers[] = { tracedToSampled, accumToSampled };
+            // albedoImage: written by path tracer, read by denoiser
+            denoiseBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            denoiseBarriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            denoiseBarriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            denoiseBarriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            denoiseBarriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            denoiseBarriers[1].image = albedoImage;
+            denoiseBarriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            denoiseBarriers[1].subresourceRange.baseMipLevel = 0;
+            denoiseBarriers[1].subresourceRange.levelCount = 1;
+            denoiseBarriers[1].subresourceRange.baseArrayLayer = 0;
+            denoiseBarriers[1].subresourceRange.layerCount = 1;
+            denoiseBarriers[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            denoiseBarriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+            // normalImage: written by path tracer, read by denoiser
+            denoiseBarriers[2].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            denoiseBarriers[2].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            denoiseBarriers[2].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            denoiseBarriers[2].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            denoiseBarriers[2].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            denoiseBarriers[2].image = normalImage;
+            denoiseBarriers[2].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            denoiseBarriers[2].subresourceRange.baseMipLevel = 0;
+            denoiseBarriers[2].subresourceRange.levelCount = 1;
+            denoiseBarriers[2].subresourceRange.baseArrayLayer = 0;
+            denoiseBarriers[2].subresourceRange.layerCount = 1;
+            denoiseBarriers[2].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            denoiseBarriers[2].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+            // depthGuideImage: written by path tracer, read by denoiser
+            denoiseBarriers[3].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            denoiseBarriers[3].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            denoiseBarriers[3].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            denoiseBarriers[3].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            denoiseBarriers[3].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            denoiseBarriers[3].image = depthGuideImage;
+            denoiseBarriers[3].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            denoiseBarriers[3].subresourceRange.baseMipLevel = 0;
+            denoiseBarriers[3].subresourceRange.levelCount = 1;
+            denoiseBarriers[3].subresourceRange.baseArrayLayer = 0;
+            denoiseBarriers[3].subresourceRange.layerCount = 1;
+            denoiseBarriers[3].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            denoiseBarriers[3].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+            // denoisedImage: prepare as writable output for denoiser
+            denoiseBarriers[4].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            denoiseBarriers[4].oldLayout =
+                (accumulationFrameIndex == 0)
+                ? VK_IMAGE_LAYOUT_UNDEFINED
+                : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            denoiseBarriers[4].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            denoiseBarriers[4].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            denoiseBarriers[4].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            denoiseBarriers[4].image = denoisedImage;
+            denoiseBarriers[4].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            denoiseBarriers[4].subresourceRange.baseMipLevel = 0;
+            denoiseBarriers[4].subresourceRange.levelCount = 1;
+            denoiseBarriers[4].subresourceRange.baseArrayLayer = 0;
+            denoiseBarriers[4].subresourceRange.layerCount = 1;
+            denoiseBarriers[4].srcAccessMask = 0;
+            denoiseBarriers[4].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 
             vkCmdPipelineBarrier(
                 cmd,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 0,
                 0, nullptr,
                 0, nullptr,
-                2, toSampledBarriers
+                5, denoiseBarriers
             );
+
+            VkImageMemoryBarrier denoisedToSampled{};
+            denoisedToSampled.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            denoisedToSampled.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            denoisedToSampled.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            denoisedToSampled.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            denoisedToSampled.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            denoisedToSampled.image = denoisedImage;
+            denoisedToSampled.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            denoisedToSampled.subresourceRange.baseMipLevel = 0;
+            denoisedToSampled.subresourceRange.levelCount = 1;
+            denoisedToSampled.subresourceRange.baseArrayLayer = 0;
+            denoisedToSampled.subresourceRange.layerCount = 1;
+            denoisedToSampled.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            denoisedToSampled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
             VkClearValue clear{};
             clear.color = { {0.02f, 0.02f, 0.02f, 1.0f} };
@@ -2065,6 +2440,29 @@ int main() {
             rpbi.renderArea.extent = extent;
             rpbi.clearValueCount = 1;
             rpbi.pClearValues = &clear;
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, denoisePipeline);
+            vkCmdBindDescriptorSets(
+                cmd,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                denoisePipelineLayout,
+                0,
+                1,
+                &denoiseSet,
+                0,
+                nullptr
+            );
+            vkCmdDispatch(cmd, (extent.width + 7) / 8, (extent.height + 7) / 8, 1);
+
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0,
+                0, nullptr,
+                0, nullptr,
+                1, &denoisedToSampled
+            );
 
             vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, presentPipeline);
@@ -2118,6 +2516,7 @@ int main() {
         ImGui::DestroyContext();
 
         vkDestroyDescriptorPool(device, imguiPool, nullptr);
+        vkDestroyDescriptorPool(device, imguiDescriptorPool, nullptr);
 
         vkDestroyFence(device, inFlight, nullptr);
         vkDestroySemaphore(device, renderFinished, nullptr);
@@ -2128,22 +2527,40 @@ int main() {
         destroyBuffer(rtCtx, blasIndexBuffer);
         destroyBuffer(rtCtx, pathBuffer);
         destroyBuffer(rtCtx, frameParamsBuffer);
+        destroyBuffer(rtCtx, denoiseParamsBuffer);
 
         vkDestroySampler(device, presentSampler, nullptr);
         vkDestroyImageView(device, tracedImageView, nullptr);
         vmaDestroyImage(allocator, tracedImage, tracedImageAlloc);
+
         vkDestroyImageView(device, accumImageView, nullptr);
         vmaDestroyImage(allocator, accumImage, accumImageAlloc);
 
+        vkDestroyImageView(device, denoisedImageView, nullptr);
+        vmaDestroyImage(allocator, denoisedImage, denoisedImageAlloc);
+
+        vkDestroyImageView(device, depthGuideImageView, nullptr);
+        vmaDestroyImage(allocator, depthGuideImage, depthGuideImageAlloc);
+
+        vkDestroyImageView(device, normalImageView, nullptr);
+        vmaDestroyImage(allocator, normalImage, normalImageAlloc);
+
+        vkDestroyImageView(device, albedoImageView, nullptr);
+        vmaDestroyImage(allocator, albedoImage, albedoImageAlloc);
+
         vkDestroyDescriptorSetLayout(device, computeSetLayout, nullptr);
+        vkDestroyDescriptorSetLayout(device, denoiseSetLayout, nullptr);
         vkDestroyDescriptorSetLayout(device, presentSetLayout, nullptr);
 
         vkDestroyPipeline(device, computePipeline, nullptr);
         vkDestroyPipeline(device, presentPipeline, nullptr);
+        vkDestroyPipeline(device, denoisePipeline, nullptr);
 
         vkDestroyPipelineLayout(device, computePipelineLayout, nullptr);
         vkDestroyPipelineLayout(device, presentPipelineLayout, nullptr);
+        vkDestroyPipelineLayout(device, denoisePipelineLayout, nullptr);
 
+        vkDestroyShaderModule(device, denoiseModule, nullptr);
         vkDestroyShaderModule(device, compModule, nullptr);
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
         vmaDestroyAllocator(allocator);

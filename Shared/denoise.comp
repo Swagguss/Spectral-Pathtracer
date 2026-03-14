@@ -1,0 +1,117 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// binding 0 = noisy input color
+layout(binding = 0, rgba32f) uniform readonly image2D inColor;
+
+// binding 1 = albedo guide
+layout(binding = 1, rgba32f) uniform readonly image2D inAlbedo;
+
+// binding 2 = shading normal guide
+layout(binding = 2, rgba32f) uniform readonly image2D inNormal;
+
+// binding 3 = depth guide
+layout(binding = 3, rgba32f) uniform readonly image2D inDepth;
+
+// binding 4 = denoised output
+layout(binding = 4, rgba32f) uniform writeonly image2D outColor;
+
+layout(std140, binding = 5) uniform DenoiseParams {
+    ivec4 imageSize_step;   // x = width, y = height, z = stepRadius, w unused
+    vec4 sigma;             // x = colorSigma, y = normalSigma, z = depthSigma, w = albedoSigma
+} params;
+
+float saturate(float x) {
+    return clamp(x, 0.0, 1.0);
+}
+
+float safeExp(float x) {
+    return exp(clamp(x, -80.0, 0.0));
+}
+
+float luminance(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 decodeNormal(vec3 n) {
+    float len2 = dot(n, n);
+    if (len2 <= 1e-12) return vec3(0.0, 0.0, 1.0);
+    return n * inversesqrt(len2);
+}
+
+float spatialWeight(ivec2 o, int stepRadius) {
+    vec2 p = vec2(o) / max(float(stepRadius), 1.0);
+    float r2 = dot(p, p);
+    return exp(-0.5 * r2);
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    int width = params.imageSize_step.x;
+    int height = params.imageSize_step.y;
+    int stepRadius = max(params.imageSize_step.z, 1);
+
+    if (pix.x >= width || pix.y >= height) {
+        return;
+    }
+
+    vec3 c0 = imageLoad(inColor, pix).rgb;
+    vec3 a0 = imageLoad(inAlbedo, pix).rgb;
+    vec3 n0 = decodeNormal(imageLoad(inNormal, pix).rgb);
+    float d0 = imageLoad(inDepth, pix).r;
+
+    // Miss/background safeguard
+    bool invalidDepth0 = !(d0 > 0.0 && d0 < 1e29);
+
+    vec3 accum = vec3(0.0);
+    float wsum = 0.0;
+
+    // 5x5 bilateral kernel
+    for (int j = -2; j <= 2; ++j) {
+        for (int i = -2; i <= 2; ++i) {
+            ivec2 q = pix + ivec2(i, j) * stepRadius;
+            q.x = clamp(q.x, 0, width - 1);
+            q.y = clamp(q.y, 0, height - 1);
+
+            vec3 c = imageLoad(inColor, q).rgb;
+            vec3 a = imageLoad(inAlbedo, q).rgb;
+            vec3 n = decodeNormal(imageLoad(inNormal, q).rgb);
+            float d = imageLoad(inDepth, q).r;
+
+            float w = spatialWeight(ivec2(i, j), stepRadius);
+
+            // Color-domain stabilization
+            float colorDiff = abs(luminance(c) - luminance(c0));
+            float colorW = safeExp(-colorDiff / max(params.sigma.x, 1e-6));
+
+            // Albedo guide
+            float albedoDiff = length(a - a0);
+            float albedoW = safeExp(-albedoDiff / max(params.sigma.w, 1e-6));
+
+            // Normal guide
+            float nd = saturate(dot(n0, n));
+            float normalDiff = 1.0 - nd;
+            float normalW = safeExp(-normalDiff / max(params.sigma.y, 1e-6));
+
+            // Depth guide
+            float depthW = 1.0;
+            bool invalidDepth = !(d > 0.0 && d < 1e29);
+
+            if (invalidDepth0 != invalidDepth) {
+                depthW = 0.0;
+            } else if (!invalidDepth0) {
+                float relDepth = abs(d - d0) / max(max(abs(d0), abs(d)), 1e-4);
+                depthW = safeExp(-relDepth / max(params.sigma.z, 1e-6));
+            }
+
+            w *= colorW * albedoW * normalW * depthW;
+
+            accum += c * w;
+            wsum += w;
+        }
+    }
+
+    vec3 outC = (wsum > 1e-8) ? (accum / wsum) : c0;
+    imageStore(outColor, pix, vec4(outC, 1.0));
+}
