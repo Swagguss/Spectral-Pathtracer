@@ -28,6 +28,8 @@ struct RenderSettings {
     float sunIntensity = 1.0f;
     float sunColor[3] = { 1.0f, 0.95f, 0.9f };
 
+    float causticStrength = 100.0f;
+
     int maxBounces = 4;
 
     bool fogEnabled = false;
@@ -96,6 +98,8 @@ struct FrameParams {
     float sunColor[4];          // xyz = color
 
     float fogParams[4];         // x = density, y = g, z/w unused
+
+    float misc[4]; // x = caustic strength
 };
 
 static void uploadMaterials(
@@ -177,6 +181,8 @@ static bool drawRendererSettingsEditor(RenderSettings& s) {
     changed |= ImGui::Checkbox("Enable NEE", &s.enableNEE);
 
     changed |= ImGui::SliderInt("Max Bounces", &s.maxBounces, 1, 32);
+
+    changed |= ImGui::SliderFloat("Caustic Strength", &s.causticStrength, 0.001f, 1000.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
 
     ImGui::Separator();
     ImGui::Text("Sun");
@@ -2152,6 +2158,8 @@ int main() {
             fp.sunEnabled = renderSettings.sunEnabled ? 1u : 0u;
             fp.fogEnabled = renderSettings.fogEnabled ? 1u : 0u;
             fp.maxBounces = static_cast<uint32_t>(renderSettings.maxBounces);
+
+            fp.misc[0] = renderSettings.causticStrength;
 
             float sx = renderSettings.sunDirection[0];
             float sy = renderSettings.sunDirection[1];

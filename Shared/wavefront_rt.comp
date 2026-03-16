@@ -8,9 +8,17 @@ const float RGB_CLAMP = 1.0;
 const float PI = 3.14159265358979323846;
 const float EPS = 1e-4;
 const float INF_T = 1e30;
+const float MEDIUM_EPS = 1e-4;
 
+const float MNEE_MIN_SPHERICAL_SAMPLE_AREA = 3e-8;
+const float MNEE_MAX_SPHERICAL_SAMPLE_AREA = 6.22;
+const float MNEE_SEGMENT_EPS = 5e-5;
+const float MNEE_VALIDATE_DIST_EPS = 5e-5;
 const uint MNEE_ITERS     = 2u;
 const uint  MNEE_SPP      = 1u;
+const float GLASS_MIN_TRANSMIT = 0.02;
+const float GLASS_ABSORB_SCALE = 2.0;
+const float MIN_T = 1e-3;
 const float MNEE_PROB_MIN = 0.05;
 const float MNEE_PROB_MAX = 0.50;
 const float MNEE_EPS_UV    = 1e-4;
@@ -75,6 +83,24 @@ struct Material {
     vec4 thinFilmSubstrateK_pad;
 };
 
+struct TriVerts {
+    vec3 p0;
+    vec3 p1;
+    vec3 p2;
+};
+
+struct SphericalTriSample {
+    float b0;
+    float b1;
+    float b2;
+    float pdfW;
+};
+
+struct LightPointSample {
+    vec3 p;
+    float pdfW;
+};
+
 struct EmissiveTriangle {
     uvec4 triIndex_pad;         // x = triIndex
     vec4 area_pmf_cdf_pad;      // x = area, y = pmf, z = cdf
@@ -93,6 +119,8 @@ layout(std140, binding = 0) uniform FrameParams {
     vec4 sunDirIntensity; // xyz = dir, w = intensity
     vec4 sunColor;        // xyz = color
     vec4 fogParams;       // x = density, y = g
+
+    vec4 misc; // x = caustic strength
 } frame;
 
 layout(std430, binding = 1) buffer PathBuffer {
@@ -206,6 +234,22 @@ vec2 clampBaryToTriangle(vec2 uv) {
     return vec2(u, v);
 }
 
+bool baryInsideTriangle(vec2 uv) {
+    float u = uv.x;
+    float v = uv.y;
+    float w = 1.0 - u - v;
+    return u >= 0.0 && v >= 0.0 && w >= 0.0;
+}
+
+bool seedInsideTriangles(MneeSeed s) {
+    for (uint i = 0u; i < s.count; ++i) {
+        if (!baryInsideTriangle(s.uv[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 vec2 worldToTriangleBary(vec3 p, vec3 a, vec3 b, vec3 c) {
     vec3 v0 = b - a;
     vec3 v1 = c - a;
@@ -281,6 +325,86 @@ vec3 xyz_to_linear_srgb(vec3 xyz) {
     return vec3(r, g, b);
 }
 
+vec3 orthonormalT(vec3 N) {
+    return normalize(abs(N.z) < 0.999
+        ? cross(N, vec3(0.0, 0.0, 1.0))
+        : cross(N, vec3(0.0, 1.0, 0.0)));
+}
+
+void makeBasis(vec3 N, out vec3 T, out vec3 B) {
+    T = orthonormalT(N);
+    B = cross(T, N);
+}
+
+float phaseHG(float cosTheta, float g) {
+    float g2 = g * g;
+    float denom = 1.0 + g2 - 2.0 * g * cosTheta;
+    return (1.0 - g2) / max(4.0 * PI * denom * sqrt(denom), 1e-8);
+}
+
+float phaseHGPdf(float cosTheta, float g) {
+    return phaseHG(cosTheta, g);
+}
+
+vec3 samplePhaseHG(vec3 wo, float g, vec2 u, out float pdf) {
+    float cosTheta;
+    if (abs(g) < 1e-3) {
+        cosTheta = 1.0 - 2.0 * u.x;
+    } else {
+        float sqr = (1.0 - g * g) / (1.0 - g + 2.0 * g * u.x);
+        cosTheta = (1.0 + g * g - sqr * sqr) / (2.0 * g);
+        cosTheta = clamp(cosTheta, -1.0, 1.0);
+    }
+
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    float phi = 2.0 * PI * u.y;
+
+    vec3 w = normalize(-wo);
+    vec3 T, B;
+    makeBasis(w, T, B);
+
+    vec3 wi = normalize(
+        T * (cos(phi) * sinTheta) +
+        B * (sin(phi) * sinTheta) +
+        w * cosTheta
+    );
+
+    pdf = phaseHGPdf(dot(w, wi), g);
+    return wi;
+}
+
+float sampleFreeFlight(float sigmaT, inout uint rng) {
+    float u = max(1e-8, 1.0 - rand01(rng));
+    return -log(u) / max(sigmaT, 1e-8);
+}
+
+float transmittanceHomogeneous(float sigmaT, float dist) {
+    return exp(-sigmaT * max(dist, 0.0));
+}
+
+bool traceAnyHit(
+    vec3 ro,
+    vec3 rd,
+    float tMax
+) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq,
+        sceneTLAS,
+        gl_RayFlagsOpaqueEXT,
+        0xFF,
+        ro,
+        EPS,
+        rd,
+        tMax
+    );
+
+    while (rayQueryProceedEXT(rq)) {
+    }
+
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
 float iorAtLambda(float iorD, float dispersionStrength, float lambdaNm) {
     float lambda = lambdaNm * 1e-3; // um
     float V = mix(80.0, 10.0, clamp(dispersionStrength, 0.0, 1.0));
@@ -309,14 +433,14 @@ vec3 whiteBalanceRGB() {
     return max(xyz_to_linear_srgb(xyzE), vec3(1e-6));
 }
 
-float mneeAttemptProb(float receiverDiffuseLike, uint depth) {
+float mneeAttemptProb(float glossyWeight, uint depth) {
     if (depth != 0u) return 0.0;
     if (frame.extra.x == 0u) return 0.0;
 
-    float dl = clamp(receiverDiffuseLike, 0.0, 1.0);
-    if (dl <= 0.0) return 0.0;
+    float gw = clamp(glossyWeight, 0.0, 1.0);
+    if (gw <= 0.0) return 0.0;
 
-    return mix(MNEE_PROB_MIN, MNEE_PROB_MAX, dl);
+    return mix(MNEE_PROB_MIN, MNEE_PROB_MAX, gw);
 }
 
 vec3 loadVertex(uint vertexIndex) {
@@ -335,6 +459,38 @@ void loadTriangle(uint triIndex, out vec3 v0, out vec3 v1, out vec3 v2) {
     v0 = loadVertex(i0);
     v1 = loadVertex(i1);
     v2 = loadVertex(i2);
+}
+
+float safeAcos(float x) {
+    return acos(clamp(x, -1.0, 1.0));
+}
+
+vec3 orthonormalComponent(vec3 x, vec3 y) {
+    return normalize(x - y * dot(x, y));
+}
+
+TriVerts loadTriVerts(uint triIndex) {
+    vec3 v0, v1, v2;
+    loadTriangle(triIndex, v0, v1, v2);
+    TriVerts tv;
+    tv.p0 = v0;
+    tv.p1 = v1;
+    tv.p2 = v2;
+    return tv;
+}
+
+uint quadAlternateIfSameMat(uint triIndex) {
+    uint alt = triIndex ^ 1u;
+    if (triangleMaterialIndices[alt] == triangleMaterialIndices[triIndex]) {
+        return alt;
+    }
+    return triIndex;
+}
+
+float triAreaJacobianUV(uint triIndex) {
+    vec3 v0, v1, v2;
+    loadTriangle(triIndex, v0, v1, v2);
+    return length(cross(v1 - v0, v2 - v0));
 }
 
 vec3 triPointBaryUnclamped(uint triIndex, float u, float v) {
@@ -358,6 +514,98 @@ vec3 projectPointToTrianglePlane(vec3 p, vec3 a, vec3 b, vec3 c) {
     vec3 n = triangleNormal(a, b, c);
     float d = dot(p - a, n);
     return p - d * n;
+}
+
+SphericalTriSample sampleSphericalTriangle(
+    vec3 p0, vec3 p1, vec3 p2,
+    vec3 refP,
+    vec2 u
+) {
+    SphericalTriSample outS;
+    outS.b0 = 0.0;
+    outS.b1 = 0.0;
+    outS.b2 = 0.0;
+    outS.pdfW = 0.0;
+
+    vec3 a = normalize(p0 - refP);
+    vec3 b = normalize(p1 - refP);
+    vec3 c = normalize(p2 - refP);
+
+    vec3 n_ab = cross(a, b);
+    vec3 n_bc = cross(b, c);
+    vec3 n_ca = cross(c, a);
+
+    if (dot(n_ab, n_ab) == 0.0 || dot(n_bc, n_bc) == 0.0 || dot(n_ca, n_ca) == 0.0) {
+        return outS;
+    }
+
+    n_ab = normalize(n_ab);
+    n_bc = normalize(n_bc);
+    n_ca = normalize(n_ca);
+
+    float alpha = safeAcos(dot(n_ab, -n_ca));
+    float beta  = safeAcos(dot(n_bc, -n_ab));
+    float gamma = safeAcos(dot(n_ca, -n_bc));
+
+    float A_pi = alpha + beta + gamma;
+    float Omega = A_pi - PI;
+
+    if (Omega <= MNEE_MIN_SPHERICAL_SAMPLE_AREA || Omega >= MNEE_MAX_SPHERICAL_SAMPLE_AREA) {
+        return outS;
+    }
+
+    float Ap_pi = PI + u.x * (A_pi - PI);
+
+    float cosAlpha = cos(alpha);
+    float sinAlpha = sin(alpha);
+
+    float sinPhi = sin(Ap_pi) * cosAlpha - cos(Ap_pi) * sinAlpha;
+    float cosPhi = cos(Ap_pi) * cosAlpha + sin(Ap_pi) * sinAlpha;
+
+    float k1 = cosPhi + cosAlpha;
+    float k2 = sinPhi - sinAlpha * dot(a, b);
+
+    float num = (k2 + (k2 * cosPhi - k1 * sinPhi) * cosAlpha);
+    float den = ((k2 * sinPhi + k1 * cosPhi) * max(sinAlpha, 1e-8));
+    float cosBp = clamp(num / max(den, 1e-8), -1.0, 1.0);
+
+    float sinBp = sqrt(max(0.0, 1.0 - cosBp * cosBp));
+    vec3 c_ortho_a = orthonormalComponent(c, a);
+    vec3 cp = cosBp * a + sinBp * c_ortho_a;
+
+    float cosTheta = 1.0 - u.y * (1.0 - dot(cp, b));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    vec3 cp_ortho_b = orthonormalComponent(cp, b);
+    vec3 w = normalize(cosTheta * b + sinTheta * cp_ortho_b);
+
+    vec3 e1 = p1 - p0;
+    vec3 e2 = p2 - p0;
+    vec3 s1 = cross(w, e2);
+    float divisor = dot(s1, e1);
+    if (abs(divisor) < 1e-8) {
+        return outS;
+    }
+    float invDiv = 1.0 / divisor;
+
+    vec3 s = refP - p0;
+    float b1 = dot(s, s1) * invDiv;
+    float b2 = dot(w, cross(s, e1)) * invDiv;
+
+    b1 = clamp(b1, 0.0, 1.0);
+    b2 = clamp(b2, 0.0, 1.0);
+    if (b1 + b2 > 1.0) {
+        float ss = b1 + b2;
+        b1 /= ss;
+        b2 /= ss;
+    }
+
+    float b0 = 1.0 - b1 - b2;
+
+    outS.b0 = b0;
+    outS.b1 = b1;
+    outS.b2 = b2;
+    outS.pdfW = 1.0 / max(Omega, 1e-8);
+    return outS;
 }
 
 float gaussian2Pdf(vec2 x, float sigma) {
@@ -459,17 +707,6 @@ bool traceShadow(
     }
 
     return true;
-}
-
-vec3 orthonormalT(vec3 N) {
-    return normalize(abs(N.z) < 0.999
-        ? cross(N, vec3(0.0, 0.0, 1.0))
-        : cross(N, vec3(0.0, 1.0, 0.0)));
-}
-
-void makeBasis(vec3 N, out vec3 T, out vec3 B) {
-    T = orthonormalT(N);
-    B = cross(T, N);
 }
 
 float saturate(float x) {
@@ -590,6 +827,200 @@ bool isNullInterface(float etaI, float etaT) {
     return etaRel < 1e-4;
 }
 
+LightPointSample sampleLightPointSolidAngle(uint lightSlot, vec3 refP, inout uint rng) {
+    LightPointSample outS;
+    outS.p = vec3(0.0);
+    outS.pdfW = 0.0;
+
+    uint triId = emissiveTriangles[lightSlot].triIndex_pad.x;
+    float lightWeight = emissiveTriangles[lightSlot].area_pmf_cdf_pad.y; // pmf over lights
+
+    TriVerts tv = loadTriVerts(triId);
+
+    vec2 u = vec2(rand01(rng), rand01(rng));
+    SphericalTriSample st = sampleSphericalTriangle(tv.p0, tv.p1, tv.p2, refP, u);
+
+    if (st.pdfW > 0.0) {
+        outS.p = tv.p0 * st.b0 + tv.p1 * st.b1 + tv.p2 * st.b2;
+        outS.pdfW = lightWeight * st.pdfW;
+        return outS;
+    }
+
+    // fallback
+    vec2 b = sampleUniformTriangle(u);
+    float w0 = 1.0 - b.x - b.y;
+    float w1 = b.x;
+    float w2 = b.y;
+    vec3 lp = tv.p0 * w0 + tv.p1 * w1 + tv.p2 * w2;
+
+    vec3 toL = lp - refP;
+    float dist2 = dot(toL, toL);
+    if (dist2 <= 1e-12) return outS;
+
+    vec3 L = normalize(toL);
+    vec3 lightN = triangleNormal(tv.p0, tv.p1, tv.p2);
+    float cosAtLight = max(dot(lightN, -L), 0.0);
+    if (cosAtLight <= 1e-8) return outS;
+
+    float area = max(triangleArea(tv.p0, tv.p1, tv.p2), 1e-8);
+    float pdfA = lightWeight / area;
+
+    outS.p = lp;
+    outS.pdfW = pdfA * dist2 / max(cosAtLight, 1e-8);
+    return outS;
+}
+
+float mediumSunDirect(
+    vec3 x,
+    vec3 wo,
+    float lambda,
+    float sigmaT,
+    float g
+) {
+    if (frame.extra.y == 0u) return 0.0;
+
+    vec3 sunDir = normalize(frame.sunDirIntensity.xyz);
+    vec3 L = sunDir;
+
+    float phaseVal = phaseHG(dot(wo, L), g);
+    float pdfPhase = phaseHGPdf(dot(wo, L), g);
+
+    if (phaseVal <= 0.0 || pdfPhase <= 0.0) return 0.0;
+
+    bool occluded = traceAnyHit(x + L * MEDIUM_EPS, L, INF_T);
+    if (occluded) return 0.0;
+
+    float LeS = rgb_to_emission_spectrum(lambda, frame.sunColor.xyz * frame.sunDirIntensity.w);
+
+    // Delta directional light: only NEE can sample it, so MIS weight = 1.
+    float Tr = 1.0; // no finite distance, no medium extinction to infinity in this simple version
+    return LeS * phaseVal * Tr;
+}
+
+float mediumAreaLightDirect(
+    vec3 x,
+    vec3 wo,
+    float lambda,
+    float sigmaT,
+    float g,
+    inout uint rng
+) {
+    if (frame.extra.x == 0u) return 0.0;
+
+    uint lightSlot = sampleEmissiveTriangle(rand01(rng));
+    uint lightTriIndex = emissiveTriangles[lightSlot].triIndex_pad.x;
+    float lightArea = emissiveTriangles[lightSlot].area_pmf_cdf_pad.x;
+    float lightPmf = emissiveTriangles[lightSlot].area_pmf_cdf_pad.y;
+
+    if (lightArea <= 0.0 || lightPmf <= 0.0) return 0.0;
+
+    vec3 lv0, lv1, lv2;
+    loadTriangle(lightTriIndex, lv0, lv1, lv2);
+
+    vec2 u = vec2(rand01(rng), rand01(rng));
+    vec2 b = sampleUniformTriangle(u);
+    float w0 = 1.0 - b.x - b.y;
+    float w1 = b.x;
+    float w2 = b.y;
+
+    vec3 lightPos = w0 * lv0 + w1 * lv1 + w2 * lv2;
+    vec3 lightN = triangleNormal(lv0, lv1, lv2);
+
+    uint lightMatIndex = triangleMaterialIndices[lightTriIndex];
+    Material lightMat = materials[lightMatIndex];
+    vec3 Le = lightMat.emissive_emissiveIntensity.xyz * lightMat.emissive_emissiveIntensity.w;
+
+    vec3 toLight = lightPos - x;
+    float dist2 = dot(toLight, toLight);
+    if (dist2 <= 1e-12) return 0.0;
+
+    float dist = sqrt(dist2);
+    vec3 L = toLight / dist;
+
+    float cosLight = max(dot(lightN, -L), 0.0);
+    if (cosLight <= 1e-8) return 0.0;
+
+    bool occluded = traceShadow(x + L * MEDIUM_EPS, L, dist, lightTriIndex);
+    if (occluded) return 0.0;
+
+    float Tr = transmittanceHomogeneous(sigmaT, dist);
+
+    float LeS = rgb_to_emission_spectrum(lambda, Le);
+    float phaseVal = phaseHG(dot(wo, L), g);
+    float pdfPhase = phaseHGPdf(dot(wo, L), g);
+
+    float pdfLightArea = lightPmf / lightArea;
+    float pdfLightW = pdfLightArea * dist2 / max(cosLight, 1e-8);
+
+    float wLight = pdfLightW / max(pdfLightW + pdfPhase, 1e-8);
+
+    return LeS * Tr * phaseVal * wLight / max(pdfLightW, 1e-8);
+}
+
+bool getEmissiveTriangleInfo(
+    uint triIndex,
+    out float outArea,
+    out float outPmf
+) {
+    outArea = 0.0;
+    outPmf = 0.0;
+
+    for (uint i = 0u; i < frame.extra.x; ++i) {
+        if (emissiveTriangles[i].triIndex_pad.x == triIndex) {
+            outArea = emissiveTriangles[i].area_pmf_cdf_pad.x;
+            outPmf  = emissiveTriangles[i].area_pmf_cdf_pad.y;
+            return true;
+        }
+    }
+    return false;
+}
+
+float mediumPhaseHitEmitter(
+    vec3 scatterPos,
+    vec3 wo,
+    vec3 wi,
+    uint hitPrim,
+    float tHit,
+    float lambda,
+    float sigmaT,
+    float g
+) {
+    uint matIndex = triangleMaterialIndices[hitPrim];
+    Material mat = materials[matIndex];
+    vec3 emissive = mat.emissive_emissiveIntensity.xyz * mat.emissive_emissiveIntensity.w;
+
+    if (max(emissive.r, max(emissive.g, emissive.b)) <= 0.0) {
+        return 0.0;
+    }
+
+    float lightArea, lightPmf;
+    if (!getEmissiveTriangleInfo(hitPrim, lightArea, lightPmf)) {
+        return 0.0;
+    }
+    if (lightArea <= 0.0 || lightPmf <= 0.0) {
+        return 0.0;
+    }
+
+    vec3 v0, v1, v2;
+    loadTriangle(hitPrim, v0, v1, v2);
+    vec3 lightN = triangleNormal(v0, v1, v2);
+
+    float cosLight = max(dot(lightN, -wi), 0.0);
+    if (cosLight <= 1e-8) return 0.0;
+
+    float dist2 = tHit * tHit;
+    float pdfLightArea = lightPmf / lightArea;
+    float pdfLightW = pdfLightArea * dist2 / max(cosLight, 1e-8);
+
+    float pdfPhase = phaseHGPdf(dot(wo, wi), g);
+    float wPhase = pdfPhase / max(pdfPhase + pdfLightW, 1e-8);
+
+    float LeS = rgb_to_emission_spectrum(lambda, emissive);
+    float Tr = transmittanceHomogeneous(sigmaT, tHit);
+
+    return LeS * Tr * wPhase;
+}
+
 vec3 sampleGGXVNDF(vec3 N, vec3 V, float alpha, vec2 u) {
     vec3 Vh = normalize(vec3(alpha * V.x, alpha * V.y, V.z));
 
@@ -685,6 +1116,51 @@ float pdfGGXReflection(
     float pdfH = D * NoH;
     float pdfL = pdfH / max(4.0 * VoH, 1e-8);
     return pdfL;
+}
+
+float lightPdfSolidAngleFromPrevVertex(
+    vec3 prevPos,
+    vec3 prevGeomN,
+    vec3 dir,
+    uint hitTriIndex
+) {
+    float lightArea, lightPmf;
+    if (!getEmissiveTriangleInfo(hitTriIndex, lightArea, lightPmf)) {
+        return 0.0;
+    }
+
+    if (lightArea <= 0.0 || lightPmf <= 0.0) {
+        return 0.0;
+    }
+
+    vec3 lv0, lv1, lv2;
+    loadTriangle(hitTriIndex, lv0, lv1, lv2);
+    vec3 lightN = triangleNormal(lv0, lv1, lv2);
+
+    uint prim;
+    float tHit;
+    vec2 bary;
+    if (!traceClosest(prevPos + prevGeomN * EPS, dir, prim, tHit, bary)) {
+        return 0.0;
+    }
+
+    if (prim != hitTriIndex) {
+        return 0.0;
+    }
+
+    vec3 hitPos = prevPos + dir * tHit;
+    float dist2 = dot(hitPos - prevPos, hitPos - prevPos);
+    if (dist2 <= 1e-12) {
+        return 0.0;
+    }
+
+    float cosLight = max(dot(lightN, -dir), 0.0);
+    if (cosLight <= 1e-8) {
+        return 0.0;
+    }
+
+    float pdfArea = lightPmf / lightArea;
+    return pdfArea * dist2 / max(cosLight, 1e-8);
 }
 
 float specularSamplingWeight(vec3 F0) {
@@ -809,9 +1285,7 @@ float evalDielectricMicrofacet(
     } else {
         vec3 Hraw = -(etaI * V + etaT * L);
         float h2 = dot(Hraw, Hraw);
-        if (h2 <= 1e-12) {
-            return 0.0;
-        }
+        if (h2 <= 1e-12) return 0.0;
 
         vec3 H = Hraw * inversesqrt(h2);
         if (dot(H, N) < 0.0) H = -H;
@@ -820,9 +1294,7 @@ float evalDielectricMicrofacet(
         float VoH = abs(dot(V, H));
         float LoH = abs(dot(L, H));
 
-        if (VoH <= 1e-8 || LoH <= 1e-8) {
-            return 0.0;
-        }
+        if (VoH <= 1e-8 || LoH <= 1e-8) return 0.0;
 
         float F = fresnelDielectric(VoH, etaI, etaT);
         float D = D_GGX(NoH, alpha);
@@ -832,7 +1304,7 @@ float evalDielectricMicrofacet(
         float factor = (VoH * LoH) /
             max(abs(NoV) * abs(NoL) * denom * denom, 1e-8);
 
-        return transColor * ((1.0 - F) * D * G * factor * etaT * etaT);
+        return transColor * ((1.0 - F) * D * G * factor);
     }
 }
 
@@ -943,8 +1415,7 @@ DielectricSample sampleDielectricBSDF(
             float absNoL = max(abs(dot(N, L)), 1e-8);
 
             s.dir = normalize(L);
-            float etaScale = (etaT * etaT) / max(etaI * etaI, 1e-8);
-            s.f = albedoS * ((1.0 - Fr) * etaScale / absNoL);
+            s.f = albedoS * ((1.0 - Fr) / absNoL);
             s.pdf = max(1.0 - Fr, 1e-8);
             s.isTransmission = 1u;
             s.isDelta = 1u;
@@ -1072,29 +1543,21 @@ vec2 specConstraintReflect(
     vec3 nextP,
     uint triIndex
 ) {
-    vec3 wiVec = prevP - thisP;
-    vec3 woVec = nextP - thisP;
-
-    float wiLen2 = dot(wiVec, wiVec);
-    float woLen2 = dot(woVec, woVec);
-    if (wiLen2 <= 1e-20 || woLen2 <= 1e-20) {
-        return vec2(0.0);
-    }
-
-    vec3 wi = wiVec * inversesqrt(wiLen2);
-    vec3 wo = woVec * inversesqrt(woLen2);
+    vec3 wi = normalize(thisP - prevP);
+    vec3 wo = normalize(nextP - thisP);
 
     vec3 n = triNormalFlat(triIndex);
-    vec3 incident = -wi;
-    if (dot(incident, n) > 0.0) {
+    if (dot(wi, n) > 0.0) {
         n = -n;
     }
+
+    vec3 rdir = reflect(wi, n);
 
     vec3 T, B;
     makeBasis(n, T, B);
 
-    vec3 r = wi + wo;
-    return vec2(dot(r, T), dot(r, B));
+    vec3 diff = wo - rdir;
+    return vec2(dot(diff, T), dot(diff, B));
 }
 
 vec2 specConstraintRefract(
@@ -1104,39 +1567,32 @@ vec2 specConstraintRefract(
     uint triIndex,
     float etaMat
 ) {
-    vec3 wiVec = prevP - thisP; // from vertex toward previous point
-    vec3 woVec = nextP - thisP; // from vertex toward next point
-
-    float wiLen2 = dot(wiVec, wiVec);
-    float woLen2 = dot(woVec, woVec);
-    if (wiLen2 <= 1e-20 || woLen2 <= 1e-20) {
-        return vec2(0.0);
-    }
-
-    vec3 wi = wiVec * inversesqrt(wiLen2);
-    vec3 wo = woVec * inversesqrt(woLen2);
+    vec3 wi = normalize(thisP - prevP);
+    vec3 wo = normalize(nextP - thisP);
 
     vec3 n = triNormalFlat(triIndex);
 
-    // Orient normal so wi is incident from the outside.
-    // wi points away from the vertex toward the previous point, so -wi is the
-    // physical incoming direction toward the surface.
-    vec3 incident = -wi;
-    bool entering = dot(incident, n) < 0.0;
-    if (!entering) {
+    float etaI = 1.0;
+    float etaT = etaMat;
+
+    if (dot(wi, n) > 0.0) {
         n = -n;
+        float tmp = etaI;
+        etaI = etaT;
+        etaT = tmp;
     }
 
-    float etaI = entering ? 1.0    : etaMat;
-    float etaT = entering ? etaMat : 1.0;
+    vec3 tdir;
+    bool ok = refractDir(wi, n, etaI / etaT, tdir);
+    if (!ok) {
+        return vec2(1e3, 1e3);
+    }
 
     vec3 T, B;
     makeBasis(n, T, B);
 
-    // Tangential Snell constraint:
-    // etaI * wi_t + etaT * wo_t = 0
-    vec3 r = etaI * wi + etaT * wo;
-    return vec2(dot(r, T), dot(r, B));
+    vec3 diff = wo - normalize(tdir);
+    return vec2(dot(diff, T), dot(diff, B));
 }
 
 vec2 solve2x2(mat2 A, vec2 b) {
@@ -1311,6 +1767,91 @@ Solve6Result solve6x6(float Ain[6][6], float bIn[6]) {
     return outR;
 }
 
+bool segmentHitsExpected(vec3 o0, vec3 p1, int expectedTri) {
+    vec3 d = p1 - o0;
+    float dist2 = dot(d, d);
+    if (dist2 <= 1e-12) return false;
+
+    float dist = sqrt(dist2);
+    vec3 dir = d / dist;
+    vec3 o = o0 + dir * (MNEE_SEGMENT_EPS * frame.camData.z + MNEE_SEGMENT_EPS);
+
+    uint prim;
+    float tHit;
+    vec2 bary;
+    if (!traceClosest(o, dir, prim, tHit, bary)) return false;
+
+    if (int(prim) != expectedTri) return false;
+    return abs(tHit - dist) < (MNEE_VALIDATE_DIST_EPS * frame.camData.z + MNEE_VALIDATE_DIST_EPS);
+}
+
+bool segmentHitsExpectedQuad(vec3 o0, vec3 p1, int expectedTri) {
+    if (expectedTri < 0) return false;
+    if (segmentHitsExpected(o0, p1, expectedTri)) return true;
+
+    uint triU = uint(expectedTri);
+    uint altU = quadAlternateIfSameMat(triU);
+    if (altU == triU) return false;
+
+    return segmentHitsExpected(o0, p1, int(altU));
+}
+
+bool closeBary(vec2 a, vec2 b, float epsVal) {
+    return all(lessThanEqual(abs(a - b), vec2(epsVal)));
+}
+
+bool validateMneePath(
+    vec3 x0,
+    vec3 n0,
+    vec3 y,
+    uint lightTri,
+    MneeSeed seed
+) {
+    if (!seedInsideTriangles(seed)) return false;
+
+    vec3 x[3];
+    x[0] = triPointBaryUnclamped(seed.tri[0], seed.uv[0].x, seed.uv[0].y);
+    if (seed.count > 1u) x[1] = triPointBaryUnclamped(seed.tri[1], seed.uv[1].x, seed.uv[1].y);
+    if (seed.count > 2u) x[2] = triPointBaryUnclamped(seed.tri[2], seed.uv[2].x, seed.uv[2].y);
+
+    vec3 start = x0 + n0 * MNEE_RAY_BIAS;
+
+    for (uint i = 0u; i < seed.count; ++i) {
+        vec3 target = x[i];
+        vec3 d = target - start;
+        float dist = length(d);
+        if (dist <= 1e-8) return false;
+
+        vec3 dir = d / dist;
+
+        uint prim;
+        float tHit;
+        vec2 bary;
+        if (!traceClosest(start, dir, prim, tHit, bary)) return false;
+        if (prim != seed.tri[i]) return false;
+        if (abs(tHit - dist) > 5e-3 * max(dist, 1.0)) return false;
+        if (!closeBary(bary, seed.uv[i], 2e-2)) return false;
+
+        start = target + dir * MNEE_RAY_BIAS;
+    }
+
+    vec3 last = x[seed.count - 1u];
+    vec3 dL = y - last;
+    float distL = length(dL);
+    if (distL <= 1e-8) return false;
+
+    vec3 dirL = dL / distL;
+
+    uint primL;
+    float tHitL;
+    vec2 baryL;
+    if (!traceClosest(last + dirL * MNEE_RAY_BIAS, dirL, primL, tHitL, baryL)) return false;
+    if (primL != lightTri) return false;
+    if (abs(tHitL - distL) > 5e-3 * max(distL, 1.0)) return false;
+
+    return true;
+}
+
 MneeSeed buildMneeSeed(vec3 x0, vec3 n0, vec3 y, float lambda) {
     MneeSeed s;
     s.count = 0u;
@@ -1327,9 +1868,9 @@ MneeSeed buildMneeSeed(vec3 x0, vec3 n0, vec3 y, float lambda) {
     float dist = sqrt(dist2);
     vec3 dir0 = d0 / dist;
 
-    vec3 rayO = x0 + n0 * (5e-5);
+    vec3 rayO = x0 + n0 * (MNEE_SEGMENT_EPS * frame.camData.z + MNEE_SEGMENT_EPS);
     vec3 rayD = dir0;
-    float tMax = dist - 5e-5;
+    float tMax = dist - (MNEE_SEGMENT_EPS * frame.camData.z + MNEE_SEGMENT_EPS);
 
     for (uint i = 0u; i < 2u; ++i) {
         if (tMax <= 1e-4) break;
@@ -1347,7 +1888,7 @@ MneeSeed buildMneeSeed(vec3 x0, vec3 n0, vec3 y, float lambda) {
         s.evt[s.count] = EVT_REFRACT;
         s.count++;
 
-        float step = tHit + 5e-5;
+        float step = tHit + (MNEE_SEGMENT_EPS * frame.camData.z + MNEE_SEGMENT_EPS);
         rayO += rayD * step;
         tMax -= step;
     }
@@ -1357,10 +1898,9 @@ MneeSeed buildMneeSeed(vec3 x0, vec3 n0, vec3 y, float lambda) {
     vec3 p0 = triPointBaryUnclamped(s.tri[0], s.uv[0].x, s.uv[0].y);
     vec3 p1 = triPointBaryUnclamped(s.tri[1], s.uv[1].x, s.uv[1].y);
 
-    uint matIndex1 = triangleMaterialIndices[s.tri[1]];
-    Material m1 = materials[matIndex1];
     vec3 wi = normalize(p1 - p0);
 
+    Material m1 = materials[triangleMaterialIndices[s.tri[1]]];
     float etaGlass = iorAtLambda(
         m1.metallic_smoothShading_transmission_ior.w,
         m1.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x,
@@ -1373,24 +1913,22 @@ MneeSeed buildMneeSeed(vec3 x0, vec3 n0, vec3 y, float lambda) {
 
     if (dot(wi, n) > 0.0) {
         n = -n;
-        float tmp = etaI;
-        etaI = etaT;
-        etaT = tmp;
+        float tmp = etaI; etaI = etaT; etaT = tmp;
     }
 
-    float cosI = abs(dot(wi, -n));
+    float cosI = abs(dot(wi, n));
     float eta = etaI / etaT;
+    float sinT2 = eta * eta * max(0.0, 1.0 - cosI * cosI);
+    bool wantsReflect = sinT2 >= 1.0;
 
-    vec3 tdir;
-    bool hasTransmit = refractDir(wi, n, eta, tdir);
-
-    bool wantsReflect = !hasTransmit;
-    if (!wantsReflect) return s;
+    if (!wantsReflect) {
+        return s;
+    }
 
     vec3 rdir = reflect(wi, n);
 
-    vec3 o = p1 + rdir * (5e-5);
-    float tRemain = 1e6;
+    vec3 o = p1 + rdir * (MNEE_SEGMENT_EPS * frame.camData.z + MNEE_SEGMENT_EPS);
+    float tRem = frame.camData.z * 5.0 + 5.0;
 
     bool found = false;
     uint tri2 = 0u;
@@ -1403,9 +1941,9 @@ MneeSeed buildMneeSeed(vec3 x0, vec3 n0, vec3 y, float lambda) {
         if (!traceClosest(o, rdir, triHit, tHit, bary)) break;
 
         if (triHit == s.tri[1]) {
-            float bias = 5e-5;
+            float bias = (MNEE_SEGMENT_EPS * frame.camData.z + MNEE_SEGMENT_EPS);
             o += rdir * (tHit + bias);
-            tRemain -= (tHit + bias);
+            tRem -= (tHit + bias);
             continue;
         }
 
@@ -1417,7 +1955,9 @@ MneeSeed buildMneeSeed(vec3 x0, vec3 n0, vec3 y, float lambda) {
         break;
     }
 
-    if (!found) return s;
+    if (!found) {
+        return s;
+    }
 
     s.count = 3u;
     s.evt[0] = EVT_REFRACT;
@@ -1469,115 +2009,6 @@ void mneeConstraints(
         C[2u * i + 0u] = c.x;
         C[2u * i + 1u] = c.y;
     }
-}
-
-bool predictCausticLightPoint(
-    vec3 x0,
-    MneeSeed seed,
-    float lambda,
-    uint lightTri,
-    out vec3 yPred
-) {
-    if (seed.count == 0u) return false;
-
-    vec3 x[3];
-    x[0] = triPointBaryUnclamped(seed.tri[0], seed.uv[0].x, seed.uv[0].y);
-    if (seed.count > 1u) x[1] = triPointBaryUnclamped(seed.tri[1], seed.uv[1].x, seed.uv[1].y);
-    if (seed.count > 2u) x[2] = triPointBaryUnclamped(seed.tri[2], seed.uv[2].x, seed.uv[2].y);
-
-    vec3 curr = x0;
-    vec3 dir = normalize(x[0] - x0);
-
-    for (uint i = 0u; i < seed.count; ++i) {
-        uint triS = seed.tri[i];
-        uint matIndex = triangleMaterialIndices[triS];
-        Material matS = materials[matIndex];
-
-        vec3 hitP = x[i];
-        vec3 n = triNormalFlat(triS);
-
-        if (seed.evt[i] == EVT_REFLECT) {
-            if (dot(dir, n) > 0.0) n = -n;
-            dir = reflect(dir, n);
-        } else {
-            float etaMat = iorAtLambda(
-                matS.metallic_smoothShading_transmission_ior.w,
-                matS.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x,
-                lambda
-            );
-
-            bool entering = dot(dir, n) < 0.0;
-            if (!entering) n = -n;
-
-            float etaI = entering ? 1.0    : etaMat;
-            float etaT = entering ? etaMat : 1.0;
-
-            vec3 tdir;
-            if (!refractDir(dir, n, etaI / etaT, tdir)) {
-                dir = reflect(dir, n);
-            } else {
-                dir = tdir;
-            }
-        }
-
-        curr = hitP + dir * MNEE_RAY_BIAS;
-    }
-
-    vec3 a, b, c;
-    loadTriangle(lightTri, a, b, c);
-    vec3 nL = triangleNormal(a, b, c);
-
-    float denom = dot(dir, nL);
-    if (abs(denom) < 1e-8) return false;
-
-    float t = dot(a - curr, nL) / denom;
-    if (t <= 0.0) return false;
-
-    vec3 p = curr + dir * t;
-    vec2 uv = worldToTriangleBary(p, a, b, c);
-    uv = clampBaryToTriangle(uv);
-    yPred = triPointBaryUnclamped(lightTri, uv.x, uv.y);
-    return true;
-}
-
-bool sampleLightNearPredictedPoint(
-    uint lightTri,
-    vec3 yPred,
-    inout uint rng,
-    out vec3 y,
-    out float pdfArea
-) {
-    vec3 a, b, c;
-    loadTriangle(lightTri, a, b, c);
-
-    vec3 nL = triangleNormal(a, b, c);
-    vec3 T, B;
-    makeBasis(nL, T, B);
-
-    float edgeScale = triangleEdgeScale(a, b, c);
-    float sigma = clamp(edgeScale * MNEE_GUIDE_SIGMA_FRAC, MNEE_GUIDE_MIN_SIGMA, MNEE_GUIDE_MAX_SIGMA);
-
-    vec2 g = sampleGaussian2(rng, sigma);
-    vec3 p = yPred + T * g.x + B * g.y;
-    p = projectPointToTrianglePlane(p, a, b, c);
-
-    vec2 uv = worldToTriangleBary(p, a, b, c);
-    uv = clampBaryToTriangle(uv);
-    y = triPointBaryUnclamped(lightTri, uv.x, uv.y);
-
-    vec2 uvPred = worldToTriangleBary(yPred, a, b, c);
-    uvPred = clampBaryToTriangle(uvPred);
-    vec3 yCenter = triPointBaryUnclamped(lightTri, uvPred.x, uvPred.y);
-
-    vec3 d = y - yCenter;
-    vec2 local = vec2(dot(d, T), dot(d, B));
-
-    float area = max(triangleArea(a, b, c), 1e-8);
-    float pGauss = gaussian2Pdf(local, sigma);
-
-    // Approximate truncated Gaussian on triangle by renormalizing weakly with uniform fallback.
-    pdfArea = max(0.9 * pGauss + 0.1 * (1.0 / area), 1e-8);
-    return true;
 }
 
 float maxAbsConstraints(uint count, float C[6]) {
@@ -1774,64 +2205,103 @@ float mneeAreaCaustic(
 
     uint lightSlot = sampleEmissiveTriangle(rand01(rng));
     uint triL = emissiveTriangles[lightSlot].triIndex_pad.x;
-    float lightArea = emissiveTriangles[lightSlot].area_pmf_cdf_pad.x;
-    float lightPmf  = emissiveTriangles[lightSlot].area_pmf_cdf_pad.y;
 
-    if (lightArea <= 0.0 || lightPmf <= 0.0) return 0.0;
+    LightPointSample lps = sampleLightPointSolidAngle(lightSlot, x0, rng);
+    vec3 y = lps.p;
+    float pdfW = lps.pdfW;
 
-    // Build a provisional seed first. We still need a light point to do that,
-    // so use the emitter centroid as a weak initial target.
-    vec3 lv0, lv1, lv2;
-    loadTriangle(triL, lv0, lv1, lv2);
-    vec3 yInit = (lv0 + lv1 + lv2) / 3.0;
-
-    MneeSeed seedChain = buildMneeSeed(x0, n0, yInit, lambda);
-    if (seedChain.count == 0u) return 0.0;
-
-    // Predict where the caustic should hit the chosen emitter for this wavelength.
-    vec3 yPred;
-    if (!predictCausticLightPoint(x0, seedChain, lambda, triL, yPred)) {
-        return 0.0;
-    }
-
-    // Guided sampling around predicted point.
-    vec3 y;
-    float pdfGuideArea;
-    if (!sampleLightNearPredictedPoint(triL, yPred, rng, y, pdfGuideArea)) {
-        return 0.0;
-    }
-
-    // Include light selection PMF.
-    float pdfArea = lightPmf * pdfGuideArea;
-    if (pdfArea <= 0.0) return 0.0;
-
-    vec3 lightN = triangleNormal(lv0, lv1, lv2);
+    if (pdfW <= 0.0) return 0.0;
 
     vec3 toL0 = y - x0;
     float dist2_0 = dot(toL0, toL0);
     if (dist2_0 <= 1e-12) return 0.0;
 
-    float invDist0 = inversesqrt(dist2_0);
-    vec3 wi0 = toL0 * invDist0;
+    vec3 wi0 = toL0 * inversesqrt(dist2_0);
+
+    vec3 lv0, lv1, lv2;
+    loadTriangle(triL, lv0, lv1, lv2);
+    vec3 lightN = triangleNormal(lv0, lv1, lv2);
 
     float cosAtLight0 = max(dot(lightN, -wi0), 0.0);
     if (cosAtLight0 <= 1e-8) return 0.0;
 
-    float pdfW = pdfArea * dist2_0 / max(cosAtLight0, 1e-8);
-    if (pdfW <= 0.0) return 0.0;
+    float pdfA = pdfW * cosAtLight0 / max(dist2_0, 1e-8);
+    if (pdfA <= 0.0) return 0.0;
 
-    // Now solve manifold for actual sampled light point.
+    MneeSeed seedChain = buildMneeSeed(x0, n0, y, lambda);
+    if (seedChain.count == 0u) return 0.0;
+
     MneeSolve sol = mneeNewtonSolve(x0, y, lambda, seedChain);
-    if (!sol.ok || sol.invAbsDetJ <= 0.0) return 0.0;
+
+    if (!sol.ok) {
+        MneeSeed altSeed = seedChain;
+        for (uint i = 0u; i < altSeed.count; ++i) {
+            altSeed.tri[i] = quadAlternateIfSameMat(altSeed.tri[i]);
+        }
+        sol = mneeNewtonSolve(x0, y, lambda, altSeed);
+    }
+
+    if (!sol.ok) return 0.0;
 
     uint count = sol.seed.count;
+
+    float Jmetric = 1.0;
+    for (uint i = 0u; i < count; ++i) {
+        Jmetric *= triAreaJacobianUV(sol.seed.tri[i]);
+    }
+    
+    const bool USE_MNEE_UV_METRIC = true;
+
+    float invAbsDetJ = sol.invAbsDetJ;
+    if (USE_MNEE_UV_METRIC) {
+        invAbsDetJ *= Jmetric;
+    }
+
+    if (!(invAbsDetJ > 0.0)) return 0.0;
 
     vec3 x[3];
     x[0] = triPointBaryUnclamped(sol.seed.tri[0], sol.seed.uv[0].x, sol.seed.uv[0].y);
     if (count > 1u) x[1] = triPointBaryUnclamped(sol.seed.tri[1], sol.seed.uv[1].x, sol.seed.uv[1].y);
     if (count > 2u) x[2] = triPointBaryUnclamped(sol.seed.tri[2], sol.seed.uv[2].x, sol.seed.uv[2].y);
 
-    vec3 xLast = x[count - 1u];
+    vec3 xLast = x[0];
+    if (count == 2u) xLast = x[1];
+    if (count == 3u) xLast = x[2];
+
+    float Gprod = 1.0;
+    vec3 prev = x0;
+    vec3 prevN = n0;
+
+    for (uint i = 0u; i < count; ++i) {
+        vec3 curr = x[i];
+        vec3 d = curr - prev;
+        float dist2 = dot(d, d);
+        if (dist2 <= 1e-12) return 0.0;
+
+        vec3 wi = normalize(d);
+
+        vec3 nPrev = (i > 0u) ? triNormalFlat(sol.seed.tri[i - 1u]) : prevN;
+        vec3 nCurr = triNormalFlat(sol.seed.tri[i]);
+
+        float cosA = abs(dot(nPrev, wi));
+        float cosB = abs(dot(nCurr, -wi));
+
+        Gprod *= (cosA * cosB) / max(dist2, 1e-8);
+
+        prev = curr;
+        prevN = nCurr;
+    }
+
+    if (!segmentHitsExpectedQuad(x0 + n0 * (1e-4), x[0], int(sol.seed.tri[0]))) return 0.0;
+
+    for (uint i = 1u; i < count; ++i) {
+        if (!segmentHitsExpectedQuad(x[i - 1u], x[i], int(sol.seed.tri[i]))) return 0.0;
+    }
+
+    if (!segmentHitsExpected(xLast, y, int(triL)) &&
+        !segmentHitsExpected(xLast, y, int(quadAlternateIfSameMat(triL)))) {
+        return 0.0;
+    }
 
     vec3 L0 = normalize(x[0] - x0);
     float NoL0 = saturate(dot(n0, L0));
@@ -1842,35 +2312,40 @@ float mneeAreaCaustic(
     if (f0 <= 0.0) return 0.0;
 
     float specW = 1.0;
+    float etaFrom = 1.0;
+    bool inGlass = false;
+    float sigmaA_glass = 0.0;
+    float TrGlass = 1.0;
 
     for (uint i = 0u; i < count; ++i) {
         uint triS = sol.seed.tri[i];
-        uint matIndex = triangleMaterialIndices[triS];
-        Material matS = materials[matIndex];
-
-        float tr = clamp(matS.metallic_smoothShading_transmission_ior.z, 0.0, 1.0);
-        float tintS = clamp(rgb_to_reflectance_spectrum(lambda, matS.albedo_smoothness.xyz), 0.0, 1.0);
-
-        float surfTintT = mix(1.0, tintS, tr);
-        float surfTintR = mix(1.0, tintS, 0.05 * tr);
-
-        vec3 prevP = (i > 0u) ? x[i - 1u] : x0;
-        vec3 thisP = x[i];
-        vec3 wi = normalize(thisP - prevP);
-
+        Material matS = materials[triangleMaterialIndices[triS]];
         float etaMat = iorAtLambda(
             matS.metallic_smoothShading_transmission_ior.w,
             matS.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x,
             lambda
         );
 
+        vec3 prevP = (i > 0u) ? x[i - 1u] : x0;
+        vec3 thisP = x[i];
+        vec3 nextP = ((i + 1u) < count) ? x[i + 1u] : y;
+
+        vec3 wi = normalize(thisP - prevP);
         vec3 n = triNormalFlat(triS);
 
-        if (sol.seed.evt[i] == EVT_REFLECT) {
-            if (dot(wi, n) > 0.0) n = -n;
+        float tr = clamp(matS.metallic_smoothShading_transmission_ior.z, 0.0, 1.0);
+        float tintS = clamp(rgb_to_reflectance_spectrum(lambda, matS.albedo_smoothness.xyz), 0.0, 1.0);
+        float surfTintT = mix(1.0, tintS, tr);
+        float surfTintR = mix(1.0, tintS, 0.05 * tr);
 
-            float etaI = etaMat;
-            float etaT = 1.0;
+        if (sol.seed.evt[i] == EVT_REFLECT) {
+            float etaI = etaFrom;
+            float etaT = (etaFrom != 1.0) ? 1.0 : etaMat;
+
+            if (dot(wi, n) > 0.0) {
+                n = -n;
+                float tmp = etaI; etaI = etaT; etaT = tmp;
+            }
 
             vec3 tdir;
             bool hasTransmit = refractDir(wi, n, etaI / etaT, tdir);
@@ -1883,47 +2358,56 @@ float mneeAreaCaustic(
                 specW *= F * surfTintR;
             }
         } else {
-            bool entering = dot(wi, n) < 0.0;
-            if (!entering) n = -n;
+            float etaTo = (etaFrom != 1.0) ? 1.0 : etaMat;
 
-            float etaI = entering ? 1.0    : etaMat;
-            float etaT = entering ? etaMat : 1.0;
+            float etaI = etaFrom;
+            float etaT = etaTo;
+
+            if (dot(wi, n) > 0.0) {
+                n = -n;
+                float tmp = etaI; etaI = etaT; etaT = tmp;
+            }
 
             float cosI = abs(dot(wi, n));
             float F = fresnelDielectric(cosI, etaI, etaT);
 
             specW *= tr * (1.0 - F) * surfTintT;
-            specW *= (etaI * etaI) / max(etaT * etaT, 1e-8);
+
+            float eta2 = (etaI * etaI) / max(etaT * etaT, 1e-8);
+            specW *= eta2;
+
+            bool wasAir = etaFrom == 1.0;
+            if (wasAir) {
+                inGlass = true;
+                sigmaA_glass = GLASS_ABSORB_SCALE * (-log(max(tintS, MIN_T))) * tr;
+            } else {
+                inGlass = false;
+            }
+
+            etaFrom = etaTo;
         }
 
         if (specW <= 0.0) return 0.0;
+
+        if ((i + 1u) < count && inGlass) {
+            float dIn = distance(thisP, x[i + 1u]);
+            TrGlass *= exp(-sigmaA_glass * dIn);
+        }
     }
 
-    uint lightMatIndex = triangleMaterialIndices[triL];
-    Material lightMat = materials[lightMatIndex];
-    vec3 LeRGB = lightMat.emissive_emissiveIntensity.xyz * lightMat.emissive_emissiveIntensity.w;
+    TrGlass = max(TrGlass, GLASS_MIN_TRANSMIT);
+
+    vec3 LeRGB = materials[triangleMaterialIndices[triL]].emissive_emissiveIntensity.xyz *
+                 materials[triangleMaterialIndices[triL]].emissive_emissiveIntensity.w;
     float LeS = rgb_to_emission_spectrum(lambda, LeRGB);
 
-    float Gprod = 1.0;
-    vec3 prev = x0;
-    vec3 prevN = n0;
-
-    for (uint i = 0u; i < count; ++i) {
-        vec3 curr = x[i];
-        vec3 d = curr - prev;
-        float d2 = dot(d, d);
-        if (d2 <= 1e-12) return 0.0;
-
-        vec3 w = normalize(d);
-        vec3 currN = triNormalFlat(sol.seed.tri[i]);
-
-        float cosA = abs(dot(prevN, w));
-        float cosB = abs(dot(currN, -w));
-        Gprod *= (cosA * cosB) / max(d2, 1e-8);
-
-        prev = curr;
-        prevN = currN;
+    float totalDist = distance(x0, x[0]);
+    for (uint i = 1u; i < count; ++i) {
+        totalDist += distance(x[i - 1u], x[i]);
     }
+    totalDist += distance(xLast, y);
+
+    float TrFog = exp(-max(frame.fogParams.x, 0.0) * totalDist);
 
     vec3 toL = y - xLast;
     float dist2 = dot(toL, toL);
@@ -1938,9 +2422,11 @@ float mneeAreaCaustic(
         LeS *
         f0 * NoL0 *
         specW *
-        sol.invAbsDetJ *
+        invAbsDetJ *
+        TrGlass *
+        TrFog *
         (cosL / max(dist2, 1e-8)) /
-        max(pdfArea, 1e-8);
+        max(pdfA, 1e-8);
 
     return max(contrib, 0.0);
 }
@@ -1980,6 +2466,11 @@ void main() {
     vec3 lastRd = camRd;
     uint lastBounce = 0u;
 
+    float prevBsdfPdfW = 0.0;
+    float prevNeePdfW  = 0.0;
+    bool  prevHadNee   = false;
+    bool  prevWasDeltaEvent = true;
+
     for (uint ls = 0u; ls < LAMBDA_SPP; ++ls) {
         uint rng = pixelIndex * 9781u +
                    frame.screen.w * 6271u +
@@ -1995,18 +2486,96 @@ void main() {
         float throughput = 1.0;
         vec3 radianceXYZ = vec3(0.0);
 
-        bool prevWasSpecular = true;
-
         for (uint bounce = 0u; bounce < frame.extra.w; ++bounce) {
-            uint prim;
-            float tHit;
-            vec2 bary;
-            if (!traceClosest(ro, rd, prim, tHit, bary)) {
+            uint prim = 0u;
+            float tHit = INF_T;
+            vec2 bary = vec2(0.0);
+            bool hitSurface = traceClosest(ro, rd, prim, tHit, bary);
+
+            float sigmaT = (frame.extra.z != 0u) ? max(frame.fogParams.x, 0.0) : 0.0;
+            float fogG   = clamp(frame.fogParams.y, -0.99, 0.99);
+
+            if (sigmaT > 0.0) {
+                float tScatter = sampleFreeFlight(sigmaT, rng);
+
+                if (tScatter < tHit) {
+                    vec3 scatterPos = ro + rd * tScatter;
+
+                    vec3 wo = -rd;
+
+                    // NEE to sun
+                    if (frame.extra.y != 0u) {
+                        float sunC = mediumSunDirect(scatterPos, wo, lambda, sigmaT, fogG);
+                        radianceXYZ += (throughput * sunC) * lambdaXYZ;
+                    }
+
+                    // NEE to emissive triangles with MIS against phase sampling
+                    if (frame.extra.x != 0u) {
+                        float areaC = mediumAreaLightDirect(scatterPos, wo, lambda, sigmaT, fogG, rng);
+                        radianceXYZ += (throughput * areaC) * lambdaXYZ;
+                    }
+
+                    // Sample phase function for indirect continuation
+                    float pdfPhase;
+                    vec3 newDir = samplePhaseHG(wo, fogG, vec2(rand01(rng), rand01(rng)), pdfPhase);
+                    if (pdfPhase <= 1e-8) {
+                        lastBounce = bounce;
+                        break;
+                    }
+
+                    // Check if the phase-sampled ray immediately hits an emitter or escapes to sun.
+                    uint mPrim;
+                    float mTHit;
+                    vec2 mBary;
+                    bool mHit = traceClosest(scatterPos + newDir * MEDIUM_EPS, newDir, mPrim, mTHit, mBary);
+
+                    if (mHit) {
+                        float hitLe = mediumPhaseHitEmitter(
+                            scatterPos, wo, newDir, mPrim, mTHit, lambda, sigmaT, fogG
+                        );
+                        if (hitLe > 0.0) {
+                            radianceXYZ += (throughput * hitLe) * lambdaXYZ;
+                        }
+                    } else if (frame.extra.y != 0u) {
+                        vec3 sunDir = normalize(frame.sunDirIntensity.xyz);
+                        float cosToSun = dot(newDir, sunDir);
+                        if (cosToSun > 0.99995) {
+                            float pdfSun = 1.0; // delta light not sampled by phase path in measure-consistent way
+                            float pdfPhaseHit = phaseHGPdf(dot(wo, newDir), fogG);
+                            float wPhase = 1.0; // directional sun handled as pure NEE in this simple implementation
+                            float LeS = rgb_to_emission_spectrum(lambda, frame.sunColor.xyz * frame.sunDirIntensity.w);
+                            radianceXYZ += (throughput * LeS * wPhase) * lambdaXYZ;
+                        }
+                    }
+
+                    throughput = min(throughput, 20.0);
+
+                    ro = scatterPos + newDir * MEDIUM_EPS;
+                    rd = newDir;
+
+                    lastRo = ro;
+                    lastRd = rd;
+                    lastThroughput = throughput;
+                    lastLambda = lambda;
+                    lastRadianceXYZ = radianceXYZ;
+                    lastBounce = bounce + 1u;
+                    continue;
+                }
+
+                // No medium event before surface: apply beam transmittance
+                if (tHit < 1e30 && tHit > -1e30) {
+                    throughput *= transmittanceHomogeneous(sigmaT, tHit);
+                }
+            }
+
+            if (!hitSurface) {
+                tHit = INF_T;
                 if (bounce == 0u) {
                     imageStore(albedoImage, ivec2(pix), vec4(0.0, 0.0, 0.0, 1.0));
                     imageStore(normalImage, ivec2(pix), vec4(0.5, 0.5, 1.0, 1.0));
                     imageStore(depthImage, ivec2(pix), vec4(1e30, 0.0, 0.0, 1.0));
                 }
+                lastBounce = bounce;
                 break;
             }
 
@@ -2054,11 +2623,13 @@ void main() {
             vec3 Ns = normalize(dot(rawShadeN, Ng) >= 0.0 ? rawShadeN : -rawShadeN);
 
             if (max(emissive.r, max(emissive.g, emissive.b)) > 0.0) {
-                if (bounce == 0u || prevWasSpecular) {
-                    radianceXYZ += (throughput * emissiveS) * lambdaXYZ;
-                } else {
-                    // TODO: MIS-weighted emission on BSDF-hit light
+                float wEmit = 1.0;
+
+                if (bounce > 0u && !prevWasDeltaEvent && prevHadNee) {
+                    wEmit = prevBsdfPdfW / max(prevBsdfPdfW + prevNeePdfW, 1e-8);
                 }
+
+                radianceXYZ += (throughput * emissiveS * wEmit) * lambdaXYZ;
             }
 
             vec3 V = normalize(-rd);
@@ -2070,8 +2641,8 @@ void main() {
                 imageStore(depthImage, ivec2(pix), vec4(tHit, 0.0, 0.0, 1.0));
             }
 
-            // Area-light NEE for opaque branch
-            if (frame.extra.x > 0u && transmission <= 0.001) {
+            // Area-light NEE
+            if (frame.extra.x > 0u) {
                 uint lightSlot = sampleEmissiveTriangle(rand01(rng));
                 uint lightTriIndex = emissiveTriangles[lightSlot].triIndex_pad.x;
                 float lightArea = emissiveTriangles[lightSlot].area_pmf_cdf_pad.x;
@@ -2100,23 +2671,51 @@ void main() {
                     float dist = sqrt(dist2);
                     vec3 L = toLight / dist;
 
-                    float NoL = saturate(dot(Ns, L));
                     float cosLight = max(dot(lightN, -L), 0.0);
+                    if (cosLight > 0.0) {
+                        vec3 shadowOffsetN = dot(L, Ng) >= 0.0 ? Ng : -Ng;
+                        bool occluded = traceShadow(hitPos + shadowOffsetN * EPS, L, dist, lightTriIndex);
 
-                    if (NoL > 0.0 && cosLight > 0.0) {
-                        bool occluded = traceShadow(hitPos + Ns * EPS, L, dist, lightTriIndex);
                         if (!occluded) {
                             float pdfLight = lightPmf / lightArea;
+                            float pdfLightSolidAngle = pdfLight * dist2 / max(cosLight, 1e-8);
 
                             float LeS = rgb_to_emission_spectrum(lambda, Le);
-                            float fS = evalBSDFScalar(Ns, V, L, albedoS, smoothness, metallic);
-                            float pdfBsdf = bsdfPdf(Ns, V, L, vec3(albedoS), smoothness, metallic);
 
-                            float pdfLightSolidAngle = pdfLight * dist2 / max(cosLight, 1e-8);
-                            float wLight = pdfLightSolidAngle / max(pdfLightSolidAngle + pdfBsdf, 1e-8);
+                            float fS = 0.0;
+                            float pdfBsdf = 0.0;
+                            float cosTerm = 0.0;
+                            bool valid = false;
 
-                            float contrib = LeS * fS * NoL * wLight / max(pdfLightSolidAngle, 1e-8);
-                            radianceXYZ += (throughput * contrib) * lambdaXYZ;
+                            if (transmission > 0.001 && !isDeltaSpecular(smoothness)) {
+                                float etaI = frontFace ? 1.0 : iorLambda;
+                                float etaT = frontFace ? iorLambda : 1.0;
+
+                                bool isTransmissionMode = false;
+                                fS = evalDielectricMicrofacet(Ns, V, L,
+                                                             roughnessFromSmoothness(smoothness),
+                                                             etaI, etaT, albedoS,
+                                                             isTransmissionMode);
+                                pdfBsdf = pdfDielectricMicrofacet(Ns, V, L,
+                                                                 roughnessFromSmoothness(smoothness),
+                                                                 etaI, etaT);
+                                cosTerm = abs(dot(Ns, L));
+                                valid = (fS > 0.0 && pdfBsdf > 0.0 && cosTerm > 0.0);
+                            } else if (transmission <= 0.001) {
+                                float NoL = saturate(dot(Ns, L));
+                                if (NoL > 0.0) {
+                                    fS = evalBSDFScalar(Ns, V, L, albedoS, smoothness, metallic);
+                                    pdfBsdf = bsdfPdf(Ns, V, L, vec3(albedoS), smoothness, metallic);
+                                    cosTerm = NoL;
+                                    valid = (fS > 0.0 && pdfBsdf > 0.0);
+                                }
+                            }
+
+                            if (valid) {
+                                float wLight = pdfLightSolidAngle / max(pdfLightSolidAngle + pdfBsdf, 1e-8);
+                                float contrib = LeS * fS * cosTerm * wLight / max(pdfLightSolidAngle, 1e-8);
+                                radianceXYZ += (throughput * contrib) * lambdaXYZ;
+                            }
                         }
                     }
                 }
@@ -2124,13 +2723,13 @@ void main() {
 
             // MNEE on primary hit
             if (bounce == 0u && frame.extra.x > 0u) {
-                float receiverWeight = clamp(1.0 - smoothness, 0.0, 1.0);
-                float pMnee = mneeAttemptProb(receiverWeight, bounce);
+                float glossyWeight = clamp(smoothness, 0.0, 1.0);
+                float pMnee = 1.0;//mneeAttemptProb(glossyWeight, bounce);
 
                 if (pMnee > 0.0 && rand01(rng) < pMnee) {
                     float sum = 0.0;
                     for (uint s = 0u; s < MNEE_SPP; ++s) {
-                        sum += 0.00000001 * mneeAreaCaustic(
+                        sum += frame.misc.x * mneeAreaCaustic(
                             hitPos,
                             Ns,
                             V,
@@ -2141,7 +2740,6 @@ void main() {
                             rng
                         );
                     }
-
                     float mneeAvg = sum / float(MNEE_SPP);
                     radianceXYZ += (throughput * lambdaXYZ) * (mneeAvg / max(pMnee, 1e-8));
                 }
@@ -2174,6 +2772,11 @@ void main() {
                 newDir = normalize(ds.dir);
                 wasSpecularEvent = (ds.isDelta != 0u);
 
+                prevBsdfPdfW = ds.pdf;
+                prevNeePdfW  = 0.0;
+                prevHadNee   = false;
+                prevWasDeltaEvent = (ds.isDelta != 0u);
+
                 vec3 pushNg = dot(newDir, Ng) >= 0.0 ? Ng : -Ng;
                 ro = hitPos + pushNg * EPS + newDir * EPS;
                 rd = newDir;
@@ -2185,6 +2788,11 @@ void main() {
 
                 throughput *= F;
                 wasSpecularEvent = true;
+
+                prevBsdfPdfW = 0.0;
+                prevNeePdfW  = 0.0;
+                prevHadNee   = false;
+                prevWasDeltaEvent = true;
 
                 vec3 pushNg = dot(R, Ng) >= 0.0 ? Ng : -Ng;
                 ro = hitPos + pushNg * EPS + R * EPS;
@@ -2205,14 +2813,35 @@ void main() {
                 float fS = evalBSDFScalar(Ns, V, newDir, albedoS, smoothness, metallic);
                 throughput *= fS * NoL / max(pdf, 1e-8);
 
-                wasSpecularEvent = false;
+                vec3 F0 = mix(vec3(0.04), albedo, metallic);
+                float specW = specularSamplingWeight(F0);
+                wasSpecularEvent = (metallic > 0.5 || smoothness > 0.95 || specW > 0.5);
+
+                prevBsdfPdfW = pdf;
+                prevNeePdfW  = 0.0;
+                prevHadNee   = true;
+                prevWasDeltaEvent = false;
 
                 vec3 pushNg = dot(newDir, Ng) >= 0.0 ? Ng : -Ng;
-                ro = hitPos + pushNg * EPS + newDir * EPS;
+                vec3 rayStart = hitPos + pushNg * EPS + newDir * EPS;
+
+                uint nextPrim;
+                float nextTHit;
+                vec2 nextBary;
+                if (traceClosest(rayStart, newDir, nextPrim, nextTHit, nextBary)) {
+                    uint nextMatIndex = triangleMaterialIndices[nextPrim];
+                    Material nextMat = materials[nextMatIndex];
+                    vec3 nextEmissive = nextMat.emissive_emissiveIntensity.xyz *
+                                        nextMat.emissive_emissiveIntensity.w;
+
+                    if (max(nextEmissive.r, max(nextEmissive.g, nextEmissive.b)) > 0.0) {
+                        prevNeePdfW = lightPdfSolidAngleFromPrevVertex(hitPos, pushNg, newDir, nextPrim);
+                    }
+                }
+
+                ro = rayStart;
                 rd = normalize(newDir);
             }
-
-            prevWasSpecular = wasSpecularEvent;
 
             lastRo = ro;
             lastRd = rd;
