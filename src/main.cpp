@@ -10,6 +10,7 @@
 #include <backends/imgui_impl_vulkan.h>
 
 #include <array>
+#include <limits>
 #include <cstdint>
 #include <fstream>
 #include <cmath>
@@ -29,6 +30,8 @@ struct RenderSettings {
     float sunColor[3] = { 1.0f, 0.95f, 0.9f };
 
     float causticStrength = 100.0f;
+    float causticGatherRad = 0.01f;
+    float wavelengthBandwidth = 12.0f;
 
     int maxBounces = 4;
 
@@ -36,7 +39,6 @@ struct RenderSettings {
     float fogDensity = 0.0f;
     float fogG = 0.0f; // Henyey-Greenstein anisotropy
 
-    bool enableNEE = true;
     bool accumulate = true;
 };
 
@@ -94,13 +96,187 @@ struct FrameParams {
     float camUp[4];
     float camData[4];
 
-    float sunDirIntensity[4];   // xyz = dir, w = intensity
-    float sunColor[4];          // xyz = color
+    float sunDirIntensity[4];
+    float sunColor[4];
+    float fogParams[4];
 
-    float fogParams[4];         // x = density, y = g, z/w unused
+    // x = caustic strength
+    // y = gather radius
+    // z = wavelength bandwidth
+    // w unused
+    float misc[4];
 
-    float misc[4]; // x = caustic strength
+    float whiteBalance[4];
+
+    float gridMin[4];
+    float gridMax[4];
+    uint32_t gridRes[4]; // x=W, y=H, z=D, w=maxPhotonsPerCell
 };
+
+struct Vec3 {
+    float x, y, z;
+
+    Vec3() : x(0.0f), y(0.0f), z(0.0f) {}
+    Vec3(float xx, float yy, float zz) : x(xx), y(yy), z(zz) {}
+
+    Vec3& operator+=(const Vec3& o) {
+        x += o.x; y += o.y; z += o.z;
+        return *this;
+    }
+
+    Vec3 operator*(float s) const {
+        return Vec3(x * s, y * s, z * s);
+    }
+};
+
+struct PhotonGridInfo {
+    float minBounds[4];     // xyz used
+    float maxBounds[4];     // xyz used
+    uint32_t res[4];        // x=W, y=H, z=D, w=maxPhotonsPerCell
+};
+
+struct CausticPhoton {
+    float pos_radius[4];    // xyz = hit position, w = receiver gather radius
+    float wi_lambda[4];     // xyz = photon travel dir toward receiver, w = lambda
+    float power_pad[4];     // x = scalar photon flux, yzw unused
+};
+
+struct SceneBounds {
+    float minX, minY, minZ;
+    float maxX, maxY, maxZ;
+};
+
+static SceneBounds computeSceneBounds(const MeshData& mesh) {
+    SceneBounds b{};
+    if (mesh.vertices.empty()) {
+        b.minX = b.minY = b.minZ = -1.0f;
+        b.maxX = b.maxY = b.maxZ = 1.0f;
+        return b;
+    }
+
+    b.minX = b.maxX = mesh.vertices[0].x;
+    b.minY = b.maxY = mesh.vertices[0].y;
+    b.minZ = b.maxZ = mesh.vertices[0].z;
+
+    for (const auto& v : mesh.vertices) {
+        b.minX = std::min(b.minX, v.x);
+        b.minY = std::min(b.minY, v.y);
+        b.minZ = std::min(b.minZ, v.z);
+
+        b.maxX = std::max(b.maxX, v.x);
+        b.maxY = std::max(b.maxY, v.y);
+        b.maxZ = std::max(b.maxZ, v.z);
+    }
+
+    return b;
+}
+
+static PhotonGridInfo buildPhotonGridInfo(
+    const SceneBounds& bounds,
+    float gatherRadius
+) {
+    constexpr uint32_t BASE_COLS = 64;
+    constexpr uint32_t BASE_ROWS = 32;
+    constexpr uint32_t BASE_SLICES = 64;
+    constexpr uint32_t MAX_PHOTONS_PER_CELL = 8;
+
+    PhotonGridInfo out{};
+
+    float pad = gatherRadius * 2.0f;
+
+    float minX = bounds.minX - pad;
+    float minY = bounds.minY - pad;
+    float minZ = bounds.minZ - pad;
+
+    float maxX = bounds.maxX + pad;
+    float maxY = bounds.maxY + pad;
+    float maxZ = bounds.maxZ + pad;
+
+    float ex = std::max(maxX - minX, 1e-4f);
+    float ey = std::max(maxY - minY, 1e-4f);
+    float ez = std::max(maxZ - minZ, 1e-4f);
+
+    float longest = std::max(ex, std::max(ey, ez));
+
+    uint32_t W = std::max(1u, static_cast<uint32_t>(std::ceil((ex / longest) * BASE_COLS)));
+    uint32_t H = std::max(1u, static_cast<uint32_t>(std::ceil((ey / longest) * BASE_ROWS)));
+    uint32_t D = std::max(1u, static_cast<uint32_t>(std::ceil((ez / longest) * BASE_SLICES)));
+
+    out.minBounds[0] = minX;
+    out.minBounds[1] = minY;
+    out.minBounds[2] = minZ;
+    out.minBounds[3] = 0.0f;
+
+    out.maxBounds[0] = maxX;
+    out.maxBounds[1] = maxY;
+    out.maxBounds[2] = maxZ;
+    out.maxBounds[3] = 0.0f;
+
+    out.res[0] = W;
+    out.res[1] = H;
+    out.res[2] = D;
+    out.res[3] = MAX_PHOTONS_PER_CELL;
+
+    return out;
+}
+
+static inline float gauss1(float x, float mu, float sigma) {
+    float t = (x - mu) / sigma;
+    return std::exp(-0.5f * t * t);
+}
+
+static inline Vec3 cie_xyz_bar(float lambda) {
+    constexpr float XYZ_NORMALIZE = 0.00936f;
+
+    float x =
+        1.056f * gauss1(lambda, 599.8f, 37.9f) +
+        0.362f * gauss1(lambda, 442.0f, 16.0f) -
+        0.065f * gauss1(lambda, 501.1f, 20.4f);
+
+    float y =
+        0.821f * gauss1(lambda, 568.8f, 23.4f) +
+        0.286f * gauss1(lambda, 530.9f, 32.3f);
+
+    float z =
+        1.217f * gauss1(lambda, 437.0f, 11.8f) +
+        0.681f * gauss1(lambda, 459.0f, 26.0f);
+
+    return Vec3(
+        std::max(x, 0.0f) * XYZ_NORMALIZE,
+        std::max(y, 0.0f) * XYZ_NORMALIZE,
+        std::max(z, 0.0f) * XYZ_NORMALIZE
+    );
+}
+
+static inline Vec3 xyz_to_linear_srgb(const Vec3& xyz) {
+    float r = 3.2406f * xyz.x - 1.5372f * xyz.y - 0.4986f * xyz.z;
+    float g = -0.9689f * xyz.x + 1.8758f * xyz.y + 0.0415f * xyz.z;
+    float b = 0.0557f * xyz.x - 0.2040f * xyz.y + 1.0570f * xyz.z;
+    return Vec3(r, g, b);
+}
+
+static inline Vec3 whiteBalanceRGB() {
+    constexpr float LAMBDA_MIN = 400.0f;
+    constexpr float LAMBDA_MAX = 700.0f;
+    constexpr int N = 64;
+
+    Vec3 xyzE(0.0f, 0.0f, 0.0f);
+
+    for (int i = 0; i < N; ++i) {
+        float u = (static_cast<float>(i) + 0.5f) / static_cast<float>(N);
+        float lambda = LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * u;
+        xyzE += cie_xyz_bar(lambda);
+    }
+
+    xyzE = xyzE * ((LAMBDA_MAX - LAMBDA_MIN) / static_cast<float>(N));
+
+    Vec3 rgb = xyz_to_linear_srgb(xyzE);
+    return Vec3(
+        std::max(rgb.x, 1e-6f),
+        std::max(rgb.y, 1e-6f),
+        std::max(rgb.z, 1e-6f)
+    );
+}
 
 static void uploadMaterials(
     RtAccelContext& rtCtx,
@@ -178,11 +354,12 @@ static bool drawRendererSettingsEditor(RenderSettings& s) {
     ImGui::Begin("Renderer");
 
     changed |= ImGui::Checkbox("Accumulate", &s.accumulate);
-    changed |= ImGui::Checkbox("Enable NEE", &s.enableNEE);
 
     changed |= ImGui::SliderInt("Max Bounces", &s.maxBounces, 1, 32);
 
-    changed |= ImGui::SliderFloat("Caustic Strength", &s.causticStrength, 0.001f, 1000.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
+    changed |= ImGui::SliderFloat("Caustic Strength", &s.causticStrength, 0.0001f, 1000.0f, "%.4f", ImGuiSliderFlags_Logarithmic);
+    changed |= ImGui::SliderFloat("Caustic Gather Radius", &s.causticGatherRad, 0.001f, 1000.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
+    changed |= ImGui::SliderFloat("Caustic Wavelength Bandwidth", &s.wavelengthBandwidth, 1.0f, 30.0f, "%.3f");
 
     ImGui::Separator();
     ImGui::Text("Sun");
@@ -702,6 +879,103 @@ static std::vector<EmissiveTriangle> buildEmissiveTriangles(const MeshData& mesh
     return out;
 }
 
+static void recreatePhotonGridResources(
+    RtAccelContext& rtCtx,
+    VkDevice device,
+    VkDescriptorSet computeSet,
+    const MeshData& mesh,
+    float gatherRadius,
+    PhotonGridInfo& photonGrid,
+    uint32_t& gridCellCount,
+    uint32_t& maxPhotonsPerCell,
+    AllocatedBuffer& photonGridCountBuffer,
+    AllocatedBuffer& photonGridPhotonBuffer
+) {
+    SceneBounds sceneBounds = computeSceneBounds(mesh);
+    PhotonGridInfo newGrid = buildPhotonGridInfo(sceneBounds, gatherRadius);
+
+    uint64_t newGridCellCount64 =
+        uint64_t(newGrid.res[0]) *
+        uint64_t(newGrid.res[1]) *
+        uint64_t(newGrid.res[2]);
+
+    if (newGridCellCount64 == 0ull || newGridCellCount64 > 0xffffffffull) {
+        throw std::runtime_error("Photon grid cell count is invalid or too large.");
+    }
+
+    uint32_t newGridCellCount = static_cast<uint32_t>(newGridCellCount64);
+    uint32_t newMaxPhotonsPerCell = newGrid.res[3];
+
+    uint64_t photonSlots64 =
+        uint64_t(newGridCellCount) * uint64_t(newMaxPhotonsPerCell);
+
+    if (photonSlots64 == 0ull ||
+        photonSlots64 > (std::numeric_limits<size_t>::max() / sizeof(CausticPhoton))) {
+        throw std::runtime_error("Photon grid storage size is too large.");
+    }
+
+    destroyBuffer(rtCtx, photonGridCountBuffer);
+    destroyBuffer(rtCtx, photonGridPhotonBuffer);
+
+    photonGridCountBuffer = createBuffer(
+        rtCtx,
+        sizeof(uint32_t) * newGridCellCount,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+    );
+
+    photonGridPhotonBuffer = createBuffer(
+        rtCtx,
+        sizeof(CausticPhoton) * static_cast<size_t>(photonSlots64),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+    );
+
+    photonGrid = newGrid;
+    gridCellCount = newGridCellCount;
+    maxPhotonsPerCell = newMaxPhotonsPerCell;
+
+    VkDescriptorBufferInfo photonGridCountInfo{};
+    photonGridCountInfo.buffer = photonGridCountBuffer.buffer;
+    photonGridCountInfo.offset = 0;
+    photonGridCountInfo.range = VK_WHOLE_SIZE;
+
+    VkDescriptorBufferInfo photonGridPhotonInfo{};
+    photonGridPhotonInfo.buffer = photonGridPhotonBuffer.buffer;
+    photonGridPhotonInfo.offset = 0;
+    photonGridPhotonInfo.range = VK_WHOLE_SIZE;
+
+    std::array<VkWriteDescriptorSet, 2> writes{};
+
+    writes[0] = {};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = computeSet;
+    writes[0].dstBinding = 14;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[0].pBufferInfo = &photonGridCountInfo;
+
+    writes[1] = {};
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = computeSet;
+    writes[1].dstBinding = 15;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[1].pBufferInfo = &photonGridPhotonInfo;
+
+    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+
+    std::cout
+        << "Rebuilt photon grid: "
+        << photonGrid.res[0] << " x "
+        << photonGrid.res[1] << " x "
+        << photonGrid.res[2]
+        << " cells=" << gridCellCount
+        << " maxPerCell=" << maxPhotonsPerCell
+        << "\n";
+}
+
 int main() {
     try {
         const std::string objPath = "Shared/stanfordbunny.obj";
@@ -1217,7 +1491,7 @@ int main() {
 
         VkDescriptorSetLayout computeSetLayout = VK_NULL_HANDLE;
         {
-            std::array<VkDescriptorSetLayoutBinding, 14> bindings{};
+            std::array<VkDescriptorSetLayoutBinding, 16> bindings{};
 
             bindings[0].binding = 0;
             bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -1288,6 +1562,16 @@ int main() {
             bindings[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             bindings[13].descriptorCount = 1;
             bindings[13].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            bindings[14].binding = 14;
+            bindings[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[14].descriptorCount = 1;
+            bindings[14].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            bindings[15].binding = 15;
+            bindings[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[15].descriptorCount = 1;
+            bindings[15].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
             VkDescriptorSetLayoutCreateInfo ci{};
             ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -1548,6 +1832,22 @@ int main() {
             throw std::runtime_error("vkCreateComputePipelines(denoise) failed");
         }
 
+        const auto photonCode = readSpvFile("Shared/caustic_photons.comp.spv");
+        VkShaderModule photonModule = createShaderModule(device, photonCode);
+
+        VkComputePipelineCreateInfo photonCI{};
+        photonCI.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        photonCI.layout = computePipelineLayout;
+        photonCI.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        photonCI.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        photonCI.stage.module = photonModule;
+        photonCI.stage.pName = "main";
+
+        VkPipeline photonPipeline = VK_NULL_HANDLE;
+        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &photonCI, nullptr, &photonPipeline) != VK_SUCCESS) {
+            throw std::runtime_error("vkCreateComputePipelines(photon) failed");
+        }
+
         VkGraphicsPipelineCreateInfo gpci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
         gpci.stageCount = 2;
         gpci.pStages = shaderStages;
@@ -1628,6 +1928,19 @@ int main() {
         dp.sigma[1] = 0.10f; // normal
         dp.sigma[2] = 0.02f; // depth
         dp.sigma[3] = 0.10f; // albedo
+
+        RenderSettings renderSettings{};
+
+        SceneBounds sceneBounds = computeSceneBounds(mesh);
+        PhotonGridInfo photonGrid{};
+        uint32_t gridCellCount = 0;
+        uint32_t maxPhotonsPerCell = 0;
+
+        float lastGatherRadius = renderSettings.causticGatherRad;
+        SceneBounds lastSceneBounds = sceneBounds;
+
+        std::cout << " cells=" << gridCellCount
+            << " maxPerCell=" << maxPhotonsPerCell << "\n";
 
         AllocatedBuffer pathBuffer = createBuffer(
             rtCtx,
@@ -1723,7 +2036,6 @@ int main() {
         camera.fovY = 45.0f * 3.1415926535f / 180.0f;
 
         int selectedMaterial = 0;
-        RenderSettings renderSettings{};
 
         uint32_t accumulationFrameIndex = 0;
 
@@ -1758,7 +2070,7 @@ int main() {
         poolSizes[0].descriptorCount = 2;
 
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSizes[1].descriptorCount = 7;
+        poolSizes[1].descriptorCount = 9;
 
         poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         poolSizes[2].descriptorCount = 10;
@@ -1779,6 +2091,9 @@ int main() {
         if (vkCreateDescriptorPool(device, &poolCI, nullptr, &descriptorPool) != VK_SUCCESS) {
             throw std::runtime_error("vkCreateDescriptorPool failed");
         }
+
+        AllocatedBuffer photonGridCountBuffer{};
+        AllocatedBuffer photonGridPhotonBuffer{};
 
         VkDescriptorSet computeSet = VK_NULL_HANDLE;
         {
@@ -1928,6 +2243,19 @@ int main() {
 
             vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         }
+
+        recreatePhotonGridResources(
+            rtCtx,
+            device,
+            computeSet,
+            mesh,
+            renderSettings.causticGatherRad,
+            photonGrid,
+            gridCellCount,
+            maxPhotonsPerCell,
+            photonGridCountBuffer,
+            photonGridPhotonBuffer
+        );
 
         VkDescriptorSet denoiseSet = VK_NULL_HANDLE;
         {
@@ -2091,6 +2419,22 @@ int main() {
 
             ImGui::Render();
 
+            bool photonGridNeedsRebuild = false;
+
+            if (std::abs(renderSettings.causticGatherRad - lastGatherRadius) > 1e-8f) {
+                photonGridNeedsRebuild = true;
+            }
+
+            SceneBounds currentBounds = computeSceneBounds(mesh);
+            if (currentBounds.minX != lastSceneBounds.minX ||
+                currentBounds.minY != lastSceneBounds.minY ||
+                currentBounds.minZ != lastSceneBounds.minZ ||
+                currentBounds.maxX != lastSceneBounds.maxX ||
+                currentBounds.maxY != lastSceneBounds.maxY ||
+                currentBounds.maxZ != lastSceneBounds.maxZ) {
+                photonGridNeedsRebuild = true;
+            }
+
             bool cameraChanged = updateCameraFromInput(window, camera);
 
             if (cameraChanged || materialChanged || settingsChanged || !renderSettings.accumulate) {
@@ -2148,6 +2492,8 @@ int main() {
                 accumulationFrameIndex = 0;
             }
 
+            Vec3 whiteBalance = whiteBalanceRGB();
+
             FrameParams fp{};
             fp.width = extent.width;
             fp.height = extent.height;
@@ -2159,7 +2505,21 @@ int main() {
             fp.fogEnabled = renderSettings.fogEnabled ? 1u : 0u;
             fp.maxBounces = static_cast<uint32_t>(renderSettings.maxBounces);
 
+            constexpr uint32_t PHOTON_THREADS = 4194304;
+
             fp.misc[0] = renderSettings.causticStrength;
+            fp.misc[1] = renderSettings.causticGatherRad;
+            fp.misc[2] = renderSettings.wavelengthBandwidth;
+            fp.misc[3] = static_cast<float>(PHOTON_THREADS);
+
+            std::memcpy(fp.gridMin, photonGrid.minBounds, sizeof(fp.gridMin));
+            std::memcpy(fp.gridMax, photonGrid.maxBounds, sizeof(fp.gridMax));
+            std::memcpy(fp.gridRes, photonGrid.res, sizeof(fp.gridRes));
+
+            fp.whiteBalance[0] = whiteBalance.x;
+            fp.whiteBalance[1] = whiteBalance.y;
+            fp.whiteBalance[2] = whiteBalance.z;
+            fp.whiteBalance[3] = 1.0;
 
             float sx = renderSettings.sunDirection[0];
             float sy = renderSettings.sunDirection[1];
@@ -2196,6 +2556,25 @@ int main() {
 
             vkWaitForFences(device, 1, &inFlight, VK_TRUE, UINT64_MAX);
             vkResetFences(device, 1, &inFlight);
+
+            if (photonGridNeedsRebuild) {
+                recreatePhotonGridResources(
+                    rtCtx,
+                    device,
+                    computeSet,
+                    mesh,
+                    renderSettings.causticGatherRad,
+                    photonGrid,
+                    gridCellCount,
+                    maxPhotonsPerCell,
+                    photonGridCountBuffer,
+                    photonGridPhotonBuffer
+                );
+
+                lastGatherRadius = renderSettings.causticGatherRad;
+                lastSceneBounds = currentBounds;
+                accumulationFrameIndex = 0;
+            }
 
             uint32_t imageIndex = 0;
             VkResult acquire = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, imageAvailable, VK_NULL_HANDLE, &imageIndex);
@@ -2318,6 +2697,78 @@ int main() {
                 0, nullptr,
                 0, nullptr,
                 5, toGeneralBarriers
+            );
+
+            vkCmdFillBuffer(
+                cmd,
+                photonGridCountBuffer.buffer,
+                0,
+                sizeof(uint32_t)* gridCellCount,
+                0
+            );
+
+            VkBufferMemoryBarrier gridCountClearBarrier{};
+            gridCountClearBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            gridCountClearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            gridCountClearBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            gridCountClearBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            gridCountClearBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            gridCountClearBarrier.buffer = photonGridCountBuffer.buffer;
+            gridCountClearBarrier.offset = 0;
+            gridCountClearBarrier.size = VK_WHOLE_SIZE;
+
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0, nullptr,
+                1, &gridCountClearBarrier,
+                0, nullptr
+            );
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, photonPipeline);
+            vkCmdBindDescriptorSets(
+                cmd,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                computePipelineLayout,
+                0,
+                1,
+                &computeSet,
+                0,
+                nullptr
+            );
+
+            vkCmdDispatch(cmd, (PHOTON_THREADS + 63) / 64, 1, 1);
+
+            VkBufferMemoryBarrier photonGridBarrier[2]{};   
+
+            photonGridBarrier[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            photonGridBarrier[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            photonGridBarrier[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            photonGridBarrier[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            photonGridBarrier[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            photonGridBarrier[0].buffer = photonGridCountBuffer.buffer;
+            photonGridBarrier[0].offset = 0;
+            photonGridBarrier[0].size = VK_WHOLE_SIZE;
+
+            photonGridBarrier[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            photonGridBarrier[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            photonGridBarrier[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            photonGridBarrier[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            photonGridBarrier[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            photonGridBarrier[1].buffer = photonGridPhotonBuffer.buffer;
+            photonGridBarrier[1].offset = 0;
+            photonGridBarrier[1].size = VK_WHOLE_SIZE;
+
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0, nullptr,
+                2, photonGridBarrier,
+                0, nullptr
             );
 
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
@@ -2536,6 +2987,12 @@ int main() {
         destroyBuffer(rtCtx, pathBuffer);
         destroyBuffer(rtCtx, frameParamsBuffer);
         destroyBuffer(rtCtx, denoiseParamsBuffer);
+        if (photonGridCountBuffer.buffer != VK_NULL_HANDLE) {
+            destroyBuffer(rtCtx, photonGridCountBuffer);
+        }
+        if (photonGridPhotonBuffer.buffer != VK_NULL_HANDLE) {
+            destroyBuffer(rtCtx, photonGridPhotonBuffer);
+        }
 
         vkDestroySampler(device, presentSampler, nullptr);
         vkDestroyImageView(device, tracedImageView, nullptr);
@@ -2563,6 +3020,7 @@ int main() {
         vkDestroyPipeline(device, computePipeline, nullptr);
         vkDestroyPipeline(device, presentPipeline, nullptr);
         vkDestroyPipeline(device, denoisePipeline, nullptr);
+        vkDestroyPipeline(device, photonPipeline, nullptr);
 
         vkDestroyPipelineLayout(device, computePipelineLayout, nullptr);
         vkDestroyPipelineLayout(device, presentPipelineLayout, nullptr);
@@ -2570,6 +3028,7 @@ int main() {
 
         vkDestroyShaderModule(device, denoiseModule, nullptr);
         vkDestroyShaderModule(device, compModule, nullptr);
+        vkDestroyShaderModule(device, photonModule, nullptr);
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
         vmaDestroyAllocator(allocator);
         vkDestroyCommandPool(device, commandPool, nullptr);

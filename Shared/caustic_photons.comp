@@ -1,0 +1,470 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+const float PI = 3.14159265358979323846;
+const float EPS = 1e-4;
+const float INF_T = 1e30;
+const float LAMBDA_MIN = 400.0;
+const float LAMBDA_MAX = 700.0;
+const float XYZ_NORMALIZE = 0.00936;
+
+struct Material {
+    vec4 albedo_smoothness;
+    vec4 emissive_emissiveIntensity;
+    vec4 metallic_smoothShading_transmission_ior;
+    vec4 dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta;
+    vec4 thinFilmSubstrateK_pad;
+};
+
+struct EmissiveTriangle {
+    uvec4 triIndex_pad;
+    vec4 area_pmf_cdf_pad;
+};
+
+struct CausticPhoton {
+    vec4 pos_radius;   // xyz = receiver hit position, w = gather radius used at store time
+    vec4 wi_lambda;    // xyz = photon travel dir toward receiver, w = lambda
+    vec4 power_pad;    // x = scalar flux
+};
+
+layout(std140, binding = 0) uniform FrameParams {
+    uvec4 screen;
+    uvec4 extra;
+
+    vec4 camPos;
+    vec4 camForward;
+    vec4 camRight;
+    vec4 camUp;
+    vec4 camData;
+
+    vec4 sunDirIntensity;
+    vec4 sunColor;
+    vec4 fogParams;
+
+    vec4 misc;
+    vec4 whiteBalance;
+
+    vec4 gridMin;
+    vec4 gridMax;
+    uvec4 gridRes;
+} frame;
+
+layout(binding = 4) uniform accelerationStructureEXT sceneTLAS;
+
+layout(std430, binding = 5) readonly buffer VertexBuffer {
+    float vertexData[];
+};
+
+layout(std430, binding = 6) readonly buffer IndexBuffer {
+    uint indexData[];
+};
+
+layout(std430, binding = 7) readonly buffer TriangleMaterialBuffer {
+    uint triangleMaterialIndices[];
+};
+
+layout(std430, binding = 8) readonly buffer MaterialBuffer {
+    Material materials[];
+};
+
+layout(std430, binding = 9) readonly buffer EmissiveTriBuffer {
+    EmissiveTriangle emissiveTriangles[];
+};
+
+layout(std430, binding = 10) readonly buffer NormalBuffer {
+    float normalData[];
+};
+
+layout(std430, binding = 14) buffer PhotonGridCountBuffer {
+    uint photonGridCounts[];
+};
+
+layout(std430, binding = 15) buffer PhotonGridPhotonBuffer {
+    CausticPhoton photonGridPhotons[];
+};
+
+uint hash_u32(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+float rand01(inout uint state) {
+    state = hash_u32(state);
+    return float(state) * (1.0 / 4294967296.0);
+}
+
+float gauss1(float x, float mu, float sigma) {
+    float t = (x - mu) / sigma;
+    return exp(-0.5 * t * t);
+}
+
+float rgb_to_spectrum_unit(float lambda, vec3 rgb) {
+    float Sr = exp(-((lambda - 610.0) / 60.0) * ((lambda - 610.0) / 60.0));
+    float Sg = exp(-((lambda - 540.0) / 60.0) * ((lambda - 540.0) / 60.0));
+    float Sb = exp(-((lambda - 460.0) / 30.0) * ((lambda - 460.0) / 30.0));
+
+    float denom = max(Sr + Sg + Sb, 1e-6);
+    vec3 c = max(rgb, vec3(0.0));
+    return (c.r * Sr + c.g * Sg + c.b * Sb) / denom;
+}
+
+float rgb_to_emission_spectrum(float lambda, vec3 rgb) {
+    vec3 c = max(rgb, vec3(0.0));
+    float m = max(c.r, max(c.g, c.b));
+    if (m <= 0.0) return 0.0;
+    vec3 chroma = c / m;
+    float s = rgb_to_spectrum_unit(lambda, chroma);
+    return m * s;
+}
+
+float rgb_to_reflectance_spectrum(float lambda, vec3 rgb) {
+    vec3 c = clamp(rgb, vec3(0.0), vec3(1.0));
+    float m = max(c.r, max(c.g, c.b));
+    if (m <= 0.0) return 0.0;
+    vec3 chroma = c / m;
+    float s = rgb_to_spectrum_unit(lambda, chroma);
+    return clamp(m * s, 0.0, 0.999);
+}
+
+uvec3 photonGridRes3() {
+    return uvec3(frame.gridRes.x, frame.gridRes.y, frame.gridRes.z);
+}
+
+uint photonGridMaxPerCell() {
+    return frame.gridRes.w;
+}
+
+vec3 photonGridMin3() {
+    return frame.gridMin.xyz;
+}
+
+vec3 photonGridMax3() {
+    return frame.gridMax.xyz;
+}
+
+vec3 photonGridCellSize() {
+    vec3 ext = photonGridMax3() - photonGridMin3();
+    return ext / max(vec3(photonGridRes3()), vec3(1.0));
+}
+
+bool pointInsidePhotonGrid(vec3 p) {
+    return all(greaterThanEqual(p, photonGridMin3())) &&
+           all(lessThanEqual(p, photonGridMax3()));
+}
+
+uvec3 pointToPhotonGridCell(vec3 p) {
+    vec3 rel = (p - photonGridMin3()) / max(photonGridCellSize(), vec3(1e-8));
+    vec3 clamped = clamp(rel, vec3(0.0), vec3(photonGridRes3()) - vec3(1e-4));
+    return uvec3(clamped);
+}
+
+uint flattenPhotonGridCell(uvec3 c) {
+    uvec3 r = photonGridRes3();
+    return c.x + r.x * (c.y + r.y * c.z);
+}
+
+uint photonGridLinearIndex(uint cellIndex, uint slot) {
+    return cellIndex * photonGridMaxPerCell() + slot;
+}
+
+void storePhotonInUniformGrid(
+    vec3 receiverPos,
+    vec3 photonTravelDir,
+    float lambda,
+    float power
+) {
+    if (!pointInsidePhotonGrid(receiverPos)) {
+        return;
+    }
+
+    uvec3 cell = pointToPhotonGridCell(receiverPos);
+    uint cellIndex = flattenPhotonGridCell(cell);
+
+    uint slot = atomicAdd(photonGridCounts[cellIndex], 1u);
+    uint maxPerCell = photonGridMaxPerCell();
+
+    if (slot >= maxPerCell) {
+        // overflow: silently drop
+        return;
+    }
+
+    uint idx = photonGridLinearIndex(cellIndex, slot);
+
+    photonGridPhotons[idx].pos_radius = vec4(receiverPos, frame.misc.y);
+    photonGridPhotons[idx].wi_lambda  = vec4(photonTravelDir, lambda);
+    photonGridPhotons[idx].power_pad  = vec4(power, 0.0, 0.0, 0.0);
+}
+
+vec3 loadVertex(uint vertexIndex) {
+    uint base = vertexIndex * 3u;
+    return vec3(vertexData[base+0u], vertexData[base+1u], vertexData[base+2u]);
+}
+
+vec3 loadNormal(uint vertexIndex) {
+    uint base = vertexIndex * 3u;
+    return vec3(normalData[base+0u], normalData[base+1u], normalData[base+2u]);
+}
+
+void loadTriangle(uint triIndex, out vec3 v0, out vec3 v1, out vec3 v2) {
+    uint i0 = indexData[triIndex * 3u + 0u];
+    uint i1 = indexData[triIndex * 3u + 1u];
+    uint i2 = indexData[triIndex * 3u + 2u];
+    v0 = loadVertex(i0);
+    v1 = loadVertex(i1);
+    v2 = loadVertex(i2);
+}
+
+vec3 triangleNormal(vec3 v0, vec3 v1, vec3 v2) {
+    return normalize(cross(v1 - v0, v2 - v0));
+}
+
+vec2 sampleUniformTriangle(vec2 u) {
+    float su0 = sqrt(u.x);
+    return vec2(1.0 - su0, u.y * su0);
+}
+
+void makeBasis(vec3 N, out vec3 T, out vec3 B) {
+    T = normalize(abs(N.z) < 0.999
+        ? cross(N, vec3(0.0, 0.0, 1.0))
+        : cross(N, vec3(0.0, 1.0, 0.0)));
+    B = cross(T, N);
+}
+
+vec3 sampleCosineHemisphere(vec3 N, vec2 u) {
+    float phi = 2.0 * PI * u.x;
+    float r = sqrt(u.y);
+    float x = r * cos(phi);
+    float y = r * sin(phi);
+    float z = sqrt(max(0.0, 1.0 - u.y));
+
+    vec3 T, B;
+    makeBasis(N, T, B);
+    return normalize(T * x + B * y + N * z);
+}
+
+uint sampleEmissiveTriangle(float xi) {
+    uint count = frame.extra.x;
+    for (uint i = 0u; i < count; ++i) {
+        if (xi <= emissiveTriangles[i].area_pmf_cdf_pad.z) return i;
+    }
+    return count - 1u;
+}
+
+bool traceClosest(
+    vec3 ro, vec3 rd,
+    out uint outPrim,
+    out float outTHit,
+    out vec2 outBary
+) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, sceneTLAS, gl_RayFlagsOpaqueEXT, 0xFF, ro, EPS, rd, INF_T);
+    while (rayQueryProceedEXT(rq)) {}
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) return false;
+    outPrim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+    outTHit = rayQueryGetIntersectionTEXT(rq, true);
+    outBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+    return true;
+}
+
+float roughnessFromSmoothness(float smoothness) {
+    return max(0.02, 1.0 - clamp(smoothness, 0.0, 1.0));
+}
+
+float alphaFromSmoothness(float smoothness) {
+    float r = roughnessFromSmoothness(smoothness);
+    return max(0.001, r * r);
+}
+
+bool isDeltaSpecular(float smoothness) {
+    return smoothness > 0.98;
+}
+
+float fresnelDielectric(float cosThetaI, float etaI, float etaT) {
+    if (abs(etaI - etaT) < 1e-4) return 0.0;
+    cosThetaI = clamp(cosThetaI, -1.0, 1.0);
+
+    float sinThetaI = sqrt(max(0.0, 1.0 - cosThetaI * cosThetaI));
+    float sinThetaT = (etaI / etaT) * sinThetaI;
+    if (sinThetaT >= 1.0) return 1.0;
+
+    float cosThetaT = sqrt(max(0.0, 1.0 - sinThetaT * sinThetaT));
+
+    float rParl = ((etaT * cosThetaI) - (etaI * cosThetaT)) /
+                  ((etaT * cosThetaI) + (etaI * cosThetaT));
+    float rPerp = ((etaI * cosThetaI) - (etaT * cosThetaT)) /
+                  ((etaI * cosThetaI) + (etaT * cosThetaT));
+    return 0.5 * (rParl * rParl + rPerp * rPerp);
+}
+
+bool refractDir(vec3 I, vec3 N, float eta, out vec3 T) {
+    float cosNI = dot(N, I);
+    float k = 1.0 - eta * eta * (1.0 - cosNI * cosNI);
+    if (k < 0.0) return false;
+    T = normalize(eta * I - (eta * cosNI + sqrt(k)) * N);
+    return true;
+}
+
+float iorAtLambda(float iorD, float dispersionStrength, float lambdaNm) {
+    float lambda = lambdaNm * 1e-3;
+    float V = mix(80.0, 1.0, clamp(dispersionStrength, 0.0, 1.0));
+    float lambdaD = 0.5876;
+    float lambdaF = 0.4861;
+    float lambdaC = 0.6563;
+    float dN = (iorD - 1.0) / V;
+    float denom = (1.0 / (lambdaF * lambdaF)) - (1.0 / (lambdaC * lambdaC));
+    float B = dN / denom;
+    float A = iorD - B / (lambdaD * lambdaD);
+    return A + B / (lambda * lambda);
+}
+
+void main() {
+    uint photonIndex = gl_GlobalInvocationID.x;
+    uint maxPhotons = uint(frame.misc.w);
+    if (photonIndex >= maxPhotons) return;
+    if (frame.extra.x == 0u) return;
+
+    uint rng = photonIndex * 9781u + frame.screen.w * 6271u + 17u;
+
+    float uLambda = rand01(rng);
+    float lambda = mix(LAMBDA_MIN, LAMBDA_MAX, uLambda);
+
+    uint lightSlot = sampleEmissiveTriangle(rand01(rng));
+    uint triIndex = emissiveTriangles[lightSlot].triIndex_pad.x;
+    float lightArea = emissiveTriangles[lightSlot].area_pmf_cdf_pad.x;
+    float lightPmf  = emissiveTriangles[lightSlot].area_pmf_cdf_pad.y;
+
+    if (lightArea <= 0.0 || lightPmf <= 0.0) return;
+
+    vec3 v0, v1, v2;
+    loadTriangle(triIndex, v0, v1, v2);
+    vec3 lightN = triangleNormal(v0, v1, v2);
+
+    vec2 buv = sampleUniformTriangle(vec2(rand01(rng), rand01(rng)));
+    float b0 = 1.0 - buv.x - buv.y;
+    float b1 = buv.x;
+    float b2 = buv.y;
+    vec3 p = v0 * b0 + v1 * b1 + v2 * b2;
+
+    vec3 dir = sampleCosineHemisphere(lightN, vec2(rand01(rng), rand01(rng)));
+    float cosLight = max(dot(lightN, dir), 0.0);
+    if (cosLight <= 0.0) return;
+
+    uint matIndex = triangleMaterialIndices[triIndex];
+    Material lightMat = materials[matIndex];
+    vec3 LeRGB = lightMat.emissive_emissiveIntensity.xyz * lightMat.emissive_emissiveIntensity.w;
+    float LeS = rgb_to_emission_spectrum(lambda, LeRGB);
+    if (LeS <= 0.0) return;
+
+    float pdfPos = lightPmf / lightArea;
+    float pdfDir = cosLight / PI;
+    float power = LeS * cosLight / max(pdfPos * pdfDir, 1e-8);
+
+    vec3 ro = p + dir * EPS;
+    vec3 rd = dir;
+
+    bool hadSpecular = false;
+
+    for (uint bounce = 0u; bounce < 8u; ++bounce) {
+        uint prim;
+        float tHit;
+        vec2 bary;
+        if (!traceClosest(ro, rd, prim, tHit, bary)) return;
+
+        vec3 hitPos = ro + rd * tHit;
+
+        vec3 tv0, tv1, tv2;
+        loadTriangle(prim, tv0, tv1, tv2);
+        vec3 geomN = triangleNormal(tv0, tv1, tv2);
+
+        uint i0 = indexData[prim * 3u + 0u];
+        uint i1 = indexData[prim * 3u + 1u];
+        uint i2 = indexData[prim * 3u + 2u];
+
+        float u = bary.x;
+        float v = bary.y;
+        float w = 1.0 - u - v;
+
+        Material mat = materials[triangleMaterialIndices[prim]];
+        float transmission = mat.metallic_smoothShading_transmission_ior.z;
+        float metallic = mat.metallic_smoothShading_transmission_ior.x;
+        float smoothness = mat.albedo_smoothness.w;
+        float smoothShading = mat.metallic_smoothShading_transmission_ior.y;
+
+        vec3 n0 = loadNormal(i0);
+        vec3 n1 = loadNormal(i1);
+        vec3 n2 = loadNormal(i2);
+        vec3 smoothN = normalize(n0 * w + n1 * u + n2 * v);
+
+        bool frontFace = dot(rd, geomN) < 0.0;
+        vec3 Ng = frontFace ? geomN : -geomN;
+        vec3 rawShadeN = (smoothShading > 0.5) ? smoothN : Ng;
+        vec3 Ns = normalize(dot(rawShadeN, Ng) >= 0.0 ? rawShadeN : -rawShadeN);
+
+        vec3 V = normalize(-rd);
+
+        float sigmaA = 0.0;
+        if (frontFace) {
+            sigmaA = 0.0;
+        } else {
+            sigmaA = -log(max(rgb_to_reflectance_spectrum(lambda, mat.albedo_smoothness.xyz), 1e-3));
+        }
+
+        if (!frontFace && transmission > 0.001) {
+            float transmittance = exp(-sigmaA * tHit);
+            power *= transmittance;
+        }
+
+        bool specReceiver =
+            (transmission > 0.001 && isDeltaSpecular(smoothness)) ||
+            (transmission <= 0.001 && metallic > 0.999 && isDeltaSpecular(smoothness));
+
+        if (!specReceiver) {
+            if (hadSpecular && transmission <= 0.001) {
+                storePhotonInUniformGrid(hitPos, rd, lambda, power);
+            }
+            return;
+        }
+
+        if (transmission > 0.001) {
+            float ior = iorAtLambda(
+                mat.metallic_smoothShading_transmission_ior.w,
+                mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x,
+                lambda
+            );
+
+            float etaI = frontFace ? 1.0 : ior;
+            float etaT = frontFace ? ior : 1.0;
+            float Fr = fresnelDielectric(clamp(dot(V, Ns), 0.0, 1.0), etaI, etaT);
+
+            vec3 newDir;
+            if (rand01(rng) < Fr) {
+                newDir = reflect(-V, Ns);
+                power *= Fr;
+            } else {
+                if (!refractDir(-V, Ns, etaI / etaT, newDir)) {
+                    newDir = reflect(-V, Ns);
+                } else {
+                    power *= max(1.0 - Fr, 1e-3);
+                }
+            }
+
+            hadSpecular = true;
+            vec3 pushNg = dot(newDir, Ng) >= 0.0 ? Ng : -Ng;
+            ro = hitPos + pushNg * EPS + newDir * EPS;
+            rd = normalize(newDir);
+        } else {
+            vec3 newDir = reflect(-V, Ns);
+            hadSpecular = true;
+            vec3 pushNg = dot(newDir, Ng) >= 0.0 ? Ng : -Ng;
+            ro = hitPos + pushNg * EPS + newDir * EPS;
+            rd = normalize(newDir);
+        }
+    }
+}
