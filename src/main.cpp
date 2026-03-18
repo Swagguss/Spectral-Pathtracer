@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <vector>
 
+constexpr uint32_t PHOTON_THREADS = 16777216;
+
 struct RenderSettings {
     bool sunEnabled = true;
 
@@ -34,10 +36,12 @@ struct RenderSettings {
     float wavelengthBandwidth = 12.0f;
 
     int maxBounces = 4;
+    int causticBounces = 8;
+    int causticPhotonsPerFrame = 262144;
 
     bool fogEnabled = false;
     float fogDensity = 0.0f;
-    float fogG = 0.0f; // Henyey-Greenstein anisotropy
+    float fogG = 0.0f;
 
     bool accumulate = true;
 };
@@ -103,14 +107,27 @@ struct FrameParams {
     // x = caustic strength
     // y = gather radius
     // z = wavelength bandwidth
-    // w unused
+    // w = unused
     float misc[4];
+
+    // x = caustic bounces, w = scene extent
+    float misc2[4];
+
+    // x = photonsPerFrame
+    // y = causticFrameCounter
+    // z = accumulatedPhotonCountAfterThisFrameDispatch
+    // w = do MNEE (true: MNEE, false: Photon Mapping)
+    uint32_t causticState[4];
+
+    uint32_t transmissiveTriangleCount;
+    uint32_t padA, padB, padC;
 
     float whiteBalance[4];
 
-    float gridMin[4];
-    float gridMax[4];
-    uint32_t gridRes[4]; // x=W, y=H, z=D, w=maxPhotonsPerCell
+    uint32_t photonHitCapacity;
+    uint32_t photonPad0;
+    uint32_t photonPad1;
+    uint32_t photonPad2;
 };
 
 struct Vec3 {
@@ -129,16 +146,17 @@ struct Vec3 {
     }
 };
 
-struct PhotonGridInfo {
-    float minBounds[4];     // xyz used
-    float maxBounds[4];     // xyz used
-    uint32_t res[4];        // x=W, y=H, z=D, w=maxPhotonsPerCell
-};
-
 struct CausticPhoton {
     float pos_radius[4];    // xyz = hit position, w = receiver gather radius
     float wi_lambda[4];     // xyz = photon travel dir toward receiver, w = lambda
     float power_pad[4];     // x = scalar photon flux, yzw unused
+};
+
+struct CausticPhotonHit {
+    float pos_power[4];      // xyz = world hit pos, w = flux/power
+    float wi_pad[4];         // xyz = incoming dir at receiver, w = unused
+    float axis0_len[4];      // xyz = footprint axis 0 in world space, w = length
+    float axis1_len[4];      // xyz = footprint axis 1 in world space, w = length
 };
 
 struct SceneBounds {
@@ -169,55 +187,6 @@ static SceneBounds computeSceneBounds(const MeshData& mesh) {
     }
 
     return b;
-}
-
-static PhotonGridInfo buildPhotonGridInfo(
-    const SceneBounds& bounds,
-    float gatherRadius
-) {
-    constexpr uint32_t BASE_COLS = 64;
-    constexpr uint32_t BASE_ROWS = 32;
-    constexpr uint32_t BASE_SLICES = 64;
-    constexpr uint32_t MAX_PHOTONS_PER_CELL = 8;
-
-    PhotonGridInfo out{};
-
-    float pad = gatherRadius * 2.0f;
-
-    float minX = bounds.minX - pad;
-    float minY = bounds.minY - pad;
-    float minZ = bounds.minZ - pad;
-
-    float maxX = bounds.maxX + pad;
-    float maxY = bounds.maxY + pad;
-    float maxZ = bounds.maxZ + pad;
-
-    float ex = std::max(maxX - minX, 1e-4f);
-    float ey = std::max(maxY - minY, 1e-4f);
-    float ez = std::max(maxZ - minZ, 1e-4f);
-
-    float longest = std::max(ex, std::max(ey, ez));
-
-    uint32_t W = std::max(1u, static_cast<uint32_t>(std::ceil((ex / longest) * BASE_COLS)));
-    uint32_t H = std::max(1u, static_cast<uint32_t>(std::ceil((ey / longest) * BASE_ROWS)));
-    uint32_t D = std::max(1u, static_cast<uint32_t>(std::ceil((ez / longest) * BASE_SLICES)));
-
-    out.minBounds[0] = minX;
-    out.minBounds[1] = minY;
-    out.minBounds[2] = minZ;
-    out.minBounds[3] = 0.0f;
-
-    out.maxBounds[0] = maxX;
-    out.maxBounds[1] = maxY;
-    out.maxBounds[2] = maxZ;
-    out.maxBounds[3] = 0.0f;
-
-    out.res[0] = W;
-    out.res[1] = H;
-    out.res[2] = D;
-    out.res[3] = MAX_PHOTONS_PER_CELL;
-
-    return out;
 }
 
 static inline float gauss1(float x, float mu, float sigma) {
@@ -348,33 +317,126 @@ static bool drawMaterialEditor(MeshData& mesh, int& selectedMaterial) {
     return changed;
 }
 
-static bool drawRendererSettingsEditor(RenderSettings& s) {
+static bool drawRendererSettingsEditor(
+    RenderSettings& s,
+    DenoiseParams& dp,
+    bool& clearCausticsPressed,
+    uint32_t accumulatedPhotons,
+    uint32_t causticFrameCounter
+) {
     bool changed = false;
+    clearCausticsPressed = false;
 
     ImGui::Begin("Renderer");
 
-    changed |= ImGui::Checkbox("Accumulate", &s.accumulate);
+    if (ImGui::BeginTabBar("RendererTabs")) {
+        if (ImGui::BeginTabItem("General")) {
+            changed |= ImGui::Checkbox("Accumulate", &s.accumulate);
+            changed |= ImGui::SliderInt("Max Bounces", &s.maxBounces, 1, 32);
 
-    changed |= ImGui::SliderInt("Max Bounces", &s.maxBounces, 1, 32);
+            ImGui::Separator();
+            ImGui::Text("Sun");
+            changed |= ImGui::Checkbox("Sun Enabled", &s.sunEnabled);
+            changed |= ImGui::SliderFloat3("Sun Direction", s.sunDirection, -1.0f, 1.0f);
+            changed |= ImGui::ColorEdit3("Sun Color", s.sunColor);
+            changed |= ImGui::SliderFloat("Sun Intensity", &s.sunIntensity, 0.0f, 50.0f);
 
-    changed |= ImGui::SliderFloat("Caustic Strength", &s.causticStrength, 0.0001f, 1000.0f, "%.4f", ImGuiSliderFlags_Logarithmic);
-    changed |= ImGui::SliderFloat("Caustic Gather Radius", &s.causticGatherRad, 0.001f, 1000.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
-    changed |= ImGui::SliderFloat("Caustic Wavelength Bandwidth", &s.wavelengthBandwidth, 1.0f, 30.0f, "%.3f");
+            ImGui::Separator();
+            ImGui::Text("Fog");
+            changed |= ImGui::Checkbox("Fog Enabled", &s.fogEnabled);
+            changed |= ImGui::SliderFloat(
+                "Fog Density",
+                &s.fogDensity,
+                0.0f, 10.0f,
+                "%.4f",
+                ImGuiSliderFlags_Logarithmic
+            );
+            changed |= ImGui::SliderFloat("Fog G", &s.fogG, -0.99f, 0.99f);
 
-    ImGui::Separator();
-    ImGui::Text("Sun");
+            ImGui::EndTabItem();
+        }
 
-    changed |= ImGui::Checkbox("Sun Enabled", &s.sunEnabled);
-    changed |= ImGui::SliderFloat3("Sun Direction", s.sunDirection, -1.0f, 1.0f);
-    changed |= ImGui::ColorEdit3("Sun Color", s.sunColor);
-    changed |= ImGui::SliderFloat("Sun Intensity", &s.sunIntensity, 0.0f, 50.0f);
+        if (ImGui::BeginTabItem("Caustics")) {
+            changed |= ImGui::SliderFloat(
+                "Caustic Strength",
+                &s.causticStrength,
+                0.0001f, std::max(static_cast<float>(accumulatedPhotons), 1.0f),
+                "%.4f",
+                ImGuiSliderFlags_Logarithmic
+            );
 
-    ImGui::Separator();
-    ImGui::Text("Fog");
+            changed |= ImGui::SliderFloat(
+                "Caustic Gather Radius",
+                &s.causticGatherRad,
+                0.001f, 1.0f,
+                "%.3f",
+                ImGuiSliderFlags_Logarithmic
+            );
 
-    changed |= ImGui::Checkbox("Fog Enabled", &s.fogEnabled);
-    changed |= ImGui::SliderFloat("Fog Density", &s.fogDensity, 0.0f, 10.0f, "%.4f", ImGuiSliderFlags_Logarithmic);
-    changed |= ImGui::SliderFloat("Fog G", &s.fogG, -0.99f, 0.99f);
+            changed |= ImGui::SliderFloat(
+                "Caustic Wavelength Bandwidth",
+                &s.wavelengthBandwidth,
+                1.0f, 30.0f,
+                "%.3f"
+            );
+
+            changed |= ImGui::SliderInt("Caustic Bounces", &s.causticBounces, 1, 32);
+
+            changed |= ImGui::SliderInt(
+                "Photons Per Frame",
+                &s.causticPhotonsPerFrame,
+                0, PHOTON_THREADS
+            );
+
+            ImGui::Separator();
+            ImGui::Text("Caustic frame counter: %u", causticFrameCounter);
+            ImGui::Text("Accumulated photons: %u", accumulatedPhotons);
+
+            if (ImGui::Button("Clear Caustic Cache")) {
+                clearCausticsPressed = true;
+            }
+
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Denoiser")) {
+            changed |= ImGui::SliderInt("Denoise Step Radius", &dp.imageSize_step[2], 1, 8);
+
+            changed |= ImGui::SliderFloat(
+                "Color Sigma", &dp.sigma[0],
+                0.001f, 2.0f, "%.4f",
+                ImGuiSliderFlags_Logarithmic
+            );
+            changed |= ImGui::SliderFloat(
+                "Normal Sigma", &dp.sigma[1],
+                0.001f, 2.0f, "%.4f",
+                ImGuiSliderFlags_Logarithmic
+            );
+            changed |= ImGui::SliderFloat(
+                "Depth Sigma", &dp.sigma[2],
+                0.0001f, 1.0f, "%.5f",
+                ImGuiSliderFlags_Logarithmic
+            );
+            changed |= ImGui::SliderFloat(
+                "Albedo Sigma", &dp.sigma[3],
+                0.001f, 2.0f, "%.4f",
+                ImGuiSliderFlags_Logarithmic
+            );
+
+            if (ImGui::Button("Reset Denoiser")) {
+                dp.imageSize_step[2] = 1;
+                dp.sigma[0] = 0.15f;
+                dp.sigma[1] = 0.10f;
+                dp.sigma[2] = 0.02f;
+                dp.sigma[3] = 0.10f;
+                changed = true;
+            }
+
+            ImGui::EndTabItem();
+        }
+
+        ImGui::EndTabBar();
+    }
 
     ImGui::End();
     return changed;
@@ -879,101 +941,74 @@ static std::vector<EmissiveTriangle> buildEmissiveTriangles(const MeshData& mesh
     return out;
 }
 
-static void recreatePhotonGridResources(
-    RtAccelContext& rtCtx,
-    VkDevice device,
-    VkDescriptorSet computeSet,
-    const MeshData& mesh,
-    float gatherRadius,
-    PhotonGridInfo& photonGrid,
-    uint32_t& gridCellCount,
-    uint32_t& maxPhotonsPerCell,
-    AllocatedBuffer& photonGridCountBuffer,
-    AllocatedBuffer& photonGridPhotonBuffer
-) {
-    SceneBounds sceneBounds = computeSceneBounds(mesh);
-    PhotonGridInfo newGrid = buildPhotonGridInfo(sceneBounds, gatherRadius);
+static std::vector<TransmissiveTriangle> buildTransmissiveTriangles(const MeshData& mesh) {
+    std::vector<TransmissiveTriangle> out;
+    const uint32_t triCount = static_cast<uint32_t>(mesh.indices.size() / 3);
 
-    uint64_t newGridCellCount64 =
-        uint64_t(newGrid.res[0]) *
-        uint64_t(newGrid.res[1]) *
-        uint64_t(newGrid.res[2]);
+    float totalWeight = 0.0f;
 
-    if (newGridCellCount64 == 0ull || newGridCellCount64 > 0xffffffffull) {
-        throw std::runtime_error("Photon grid cell count is invalid or too large.");
+    for (uint32_t tri = 0; tri < triCount; ++tri) {
+        uint32_t matIndex = mesh.triangleMaterialIndices[tri];
+        const Material& mat = mesh.materials[matIndex];
+
+        const float transmission = mat.metallic_smoothShading_transmission_ior[2];
+        const float smoothness = mat.albedo_smoothness[3];
+
+        if (transmission <= 0.001f || smoothness <= 0.98f) {
+            continue;
+        }
+
+        uint32_t i0 = mesh.indices[tri * 3 + 0];
+        uint32_t i1 = mesh.indices[tri * 3 + 1];
+        uint32_t i2 = mesh.indices[tri * 3 + 2];
+
+        const Vertex& a = mesh.vertices[i0];
+        const Vertex& b = mesh.vertices[i1];
+        const Vertex& c = mesh.vertices[i2];
+
+        float abx = b.x - a.x, aby = b.y - a.y, abz = b.z - a.z;
+        float acx = c.x - a.x, acy = c.y - a.y, acz = c.z - a.z;
+
+        float cx = aby * acz - abz * acy;
+        float cy = abz * acx - abx * acz;
+        float cz = abx * acy - aby * acx;
+
+        float area = 0.5f * std::sqrt(cx * cx + cy * cy + cz * cz);
+        if (area <= 0.0f) continue;
+
+        float weight = area * transmission;
+        if (weight <= 0.0f) continue;
+
+        TransmissiveTriangle t{};
+        t.triIndex = tri;
+        t.area = area;
+        t.pmf = weight;
+        t.cdf = 0.0f;
+
+        totalWeight += weight;
+        out.push_back(t);
     }
 
-    uint32_t newGridCellCount = static_cast<uint32_t>(newGridCellCount64);
-    uint32_t newMaxPhotonsPerCell = newGrid.res[3];
+    std::sort(out.begin(), out.end(),
+        [](const TransmissiveTriangle& a, const TransmissiveTriangle& b) {
+            if (a.pmf != b.pmf) return a.pmf > b.pmf;
+            return a.triIndex < b.triIndex;
+        });
 
-    uint64_t photonSlots64 =
-        uint64_t(newGridCellCount) * uint64_t(newMaxPhotonsPerCell);
+    if (totalWeight > 0.0f) {
+        float accum = 0.0f;
+        for (auto& t : out) {
+            t.pmf /= totalWeight;
+            accum += t.pmf;
+            t.cdf = accum;
+        }
 
-    if (photonSlots64 == 0ull ||
-        photonSlots64 > (std::numeric_limits<size_t>::max() / sizeof(CausticPhoton))) {
-        throw std::runtime_error("Photon grid storage size is too large.");
+        if (!out.empty()) {
+            out.back().cdf = 1.0f;
+        }
     }
 
-    destroyBuffer(rtCtx, photonGridCountBuffer);
-    destroyBuffer(rtCtx, photonGridPhotonBuffer);
-
-    photonGridCountBuffer = createBuffer(
-        rtCtx,
-        sizeof(uint32_t) * newGridCellCount,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-    );
-
-    photonGridPhotonBuffer = createBuffer(
-        rtCtx,
-        sizeof(CausticPhoton) * static_cast<size_t>(photonSlots64),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-    );
-
-    photonGrid = newGrid;
-    gridCellCount = newGridCellCount;
-    maxPhotonsPerCell = newMaxPhotonsPerCell;
-
-    VkDescriptorBufferInfo photonGridCountInfo{};
-    photonGridCountInfo.buffer = photonGridCountBuffer.buffer;
-    photonGridCountInfo.offset = 0;
-    photonGridCountInfo.range = VK_WHOLE_SIZE;
-
-    VkDescriptorBufferInfo photonGridPhotonInfo{};
-    photonGridPhotonInfo.buffer = photonGridPhotonBuffer.buffer;
-    photonGridPhotonInfo.offset = 0;
-    photonGridPhotonInfo.range = VK_WHOLE_SIZE;
-
-    std::array<VkWriteDescriptorSet, 2> writes{};
-
-    writes[0] = {};
-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = computeSet;
-    writes[0].dstBinding = 14;
-    writes[0].descriptorCount = 1;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[0].pBufferInfo = &photonGridCountInfo;
-
-    writes[1] = {};
-    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = computeSet;
-    writes[1].dstBinding = 15;
-    writes[1].descriptorCount = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[1].pBufferInfo = &photonGridPhotonInfo;
-
-    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-
-    std::cout
-        << "Rebuilt photon grid: "
-        << photonGrid.res[0] << " x "
-        << photonGrid.res[1] << " x "
-        << photonGrid.res[2]
-        << " cells=" << gridCellCount
-        << " maxPerCell=" << maxPhotonsPerCell
-        << "\n";
+    return out;
 }
 
 int main() {
@@ -1051,11 +1086,18 @@ int main() {
         std::vector<EmissiveTriangle> emissiveTriangles = buildEmissiveTriangles(mesh);
         std::cout << "Emissive triangles: " << emissiveTriangles.size() << "\n";
 
+        std::vector<TransmissiveTriangle> transmissiveTriangles = buildTransmissiveTriangles(mesh);
+        std::cout << "Transmissive triangles: " << transmissiveTriangles.size() << "\n";
+
         std::cout << "Material count: " << mesh.materials.size() << "\n";
         std::cout << "Triangle material count: " << mesh.triangleMaterialIndices.size() << "\n";
         std::cout << "Triangle count: " << (mesh.indices.size() / 3) << "\n";
 
         FlattenedBvh bvh = buildBvh(mesh);
+        const float dx = bvh.bounds.maxX - bvh.bounds.minX;
+        const float dy = bvh.bounds.maxY - bvh.bounds.minY;
+        const float dz = bvh.bounds.maxZ - bvh.bounds.minZ;
+        const float sceneExtent = std::sqrt(dx * dx + dy * dy + dz * dz);
 
         std::cout << "BVH nodes: " << bvh.nodes.size() << "\n";
         std::cout << "BVH leaf tri refs: " << bvh.leafTriIndices.size() << "\n";
@@ -1408,6 +1450,10 @@ int main() {
         VmaAllocation denoisedImageAlloc = VK_NULL_HANDLE;
         VkImageView denoisedImageView = VK_NULL_HANDLE;
 
+        VkImage causticsImage = VK_NULL_HANDLE;
+        VmaAllocation causticsImageAlloc = VK_NULL_HANDLE;
+        VkImageView causticsImageView = VK_NULL_HANDLE;
+
         auto createStorageImage = [&](VkImage& image, VmaAllocation& alloc, VkImageView& view, const char* debugName) {
             VkImageCreateInfo ici{};
             ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -1455,6 +1501,8 @@ int main() {
         createStorageImage(depthGuideImage, depthGuideImageAlloc, depthGuideImageView, "depthGuideImage");
         createStorageImage(denoisedImage, denoisedImageAlloc, denoisedImageView, "denoisedImage");
 
+        createStorageImage(causticsImage, causticsImageAlloc, causticsImageView, "causticsImage");
+
         VkSampler presentSampler = VK_NULL_HANDLE;
         {
             VkSamplerCreateInfo sci{};
@@ -1491,7 +1539,7 @@ int main() {
 
         VkDescriptorSetLayout computeSetLayout = VK_NULL_HANDLE;
         {
-            std::array<VkDescriptorSetLayoutBinding, 16> bindings{};
+            std::array<VkDescriptorSetLayoutBinding, 18> bindings{};
 
             bindings[0].binding = 0;
             bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -1573,6 +1621,16 @@ int main() {
             bindings[15].descriptorCount = 1;
             bindings[15].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+            bindings[16].binding = 16;
+            bindings[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[16].descriptorCount = 1;
+            bindings[16].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            bindings[17].binding = 17;
+            bindings[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[17].descriptorCount = 1;
+            bindings[17].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
             VkDescriptorSetLayoutCreateInfo ci{};
             ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
             ci.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -1628,6 +1686,40 @@ int main() {
             }
         }
 
+        VkDescriptorSetLayout splatSetLayout = VK_NULL_HANDLE;
+        {
+            std::array<VkDescriptorSetLayoutBinding, 4> bindings{};
+
+            bindings[0].binding = 0;
+            bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            bindings[0].descriptorCount = 1;
+            bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            bindings[1].binding = 1;
+            bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[1].descriptorCount = 1;
+            bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            bindings[2].binding = 2;
+            bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[2].descriptorCount = 1;
+            bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            bindings[3].binding = 3;
+            bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[3].descriptorCount = 1;
+            bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            VkDescriptorSetLayoutCreateInfo ci{};
+            ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            ci.bindingCount = static_cast<uint32_t>(bindings.size());
+            ci.pBindings = bindings.data();
+
+            if (vkCreateDescriptorSetLayout(device, &ci, nullptr, &splatSetLayout) != VK_SUCCESS) {
+                throw std::runtime_error("vkCreateDescriptorSetLayout(splatSetLayout) failed");
+            }
+        }
+
         VkPipelineLayout computePipelineLayout = VK_NULL_HANDLE;
         {
             VkPipelineLayoutCreateInfo ci{};
@@ -1661,6 +1753,18 @@ int main() {
 
             if (vkCreatePipelineLayout(device, &ci, nullptr, &denoisePipelineLayout) != VK_SUCCESS) {
                 throw std::runtime_error("vkCreatePipelineLayout(denoise) failed");
+            }
+        }
+
+        VkPipelineLayout splatPipelineLayout = VK_NULL_HANDLE;
+        {
+            VkPipelineLayoutCreateInfo ci{};
+            ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            ci.setLayoutCount = 1;
+            ci.pSetLayouts = &splatSetLayout;
+
+            if (vkCreatePipelineLayout(device, &ci, nullptr, &splatPipelineLayout) != VK_SUCCESS) {
+                throw std::runtime_error("vkCreatePipelineLayout(splat) failed");
             }
         }
 
@@ -1848,6 +1952,22 @@ int main() {
             throw std::runtime_error("vkCreateComputePipelines(photon) failed");
         }
 
+        const auto splatCode = readSpvFile("Shared/caustic_splat.comp.spv");
+        VkShaderModule splatModule = createShaderModule(device, splatCode);
+
+        VkComputePipelineCreateInfo splatCI{};
+        splatCI.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        splatCI.layout = splatPipelineLayout;
+        splatCI.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        splatCI.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        splatCI.stage.module = splatModule;
+        splatCI.stage.pName = "main";
+
+        VkPipeline splatPipeline = VK_NULL_HANDLE;
+        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &splatCI, nullptr, &splatPipeline) != VK_SUCCESS) {
+            throw std::runtime_error("vkCreateComputePipelines(splat) failed");
+        }
+
         VkGraphicsPipelineCreateInfo gpci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
         gpci.stageCount = 2;
         gpci.pStages = shaderStages;
@@ -1932,15 +2052,7 @@ int main() {
         RenderSettings renderSettings{};
 
         SceneBounds sceneBounds = computeSceneBounds(mesh);
-        PhotonGridInfo photonGrid{};
-        uint32_t gridCellCount = 0;
-        uint32_t maxPhotonsPerCell = 0;
-
-        float lastGatherRadius = renderSettings.causticGatherRad;
         SceneBounds lastSceneBounds = sceneBounds;
-
-        std::cout << " cells=" << gridCellCount
-            << " maxPerCell=" << maxPhotonsPerCell << "\n";
 
         AllocatedBuffer pathBuffer = createBuffer(
             rtCtx,
@@ -1987,6 +2099,37 @@ int main() {
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
         );
+
+        AllocatedBuffer transmissiveTriBuffer = createBuffer(
+            rtCtx,
+            std::max<size_t>(sizeof(TransmissiveTriangle),
+                sizeof(TransmissiveTriangle) * transmissiveTriangles.size()),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+        );
+
+        AllocatedBuffer photonHitBuffer = createBuffer(
+            rtCtx,
+            sizeof(CausticPhotonHit) * PHOTON_THREADS,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+        );
+
+        AllocatedBuffer photonHitCounterBuffer = createBuffer(
+            rtCtx,
+            sizeof(uint32_t),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+        );
+
+        if (!transmissiveTriangles.empty()) {
+            uploadToBuffer(
+                rtCtx,
+                transmissiveTriangles.data(),
+                sizeof(TransmissiveTriangle) * transmissiveTriangles.size(),
+                transmissiveTriBuffer
+            );
+        }
 
         if (!emissiveTriangles.empty()) {
             uploadToBuffer(
@@ -2038,6 +2181,9 @@ int main() {
         int selectedMaterial = 0;
 
         uint32_t accumulationFrameIndex = 0;
+        uint32_t causticFrameCounter = 0;
+        uint32_t causticAccumulatedPhotons = 0;
+        bool causticCacheClearRequested = true;
 
         std::vector<float> rtVertices;
         rtVertices.reserve(mesh.vertices.size() * 3);
@@ -2070,10 +2216,10 @@ int main() {
         poolSizes[0].descriptorCount = 2;
 
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSizes[1].descriptorCount = 9;
+        poolSizes[1].descriptorCount = 12;
 
         poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        poolSizes[2].descriptorCount = 10;
+        poolSizes[2].descriptorCount = 12;
 
         poolSizes[3].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         poolSizes[3].descriptorCount = 1;
@@ -2083,7 +2229,7 @@ int main() {
 
         VkDescriptorPoolCreateInfo poolCI{};
         poolCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolCI.maxSets = 3;
+        poolCI.maxSets = 4;
         poolCI.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
         poolCI.pPoolSizes = poolSizes.data();
 
@@ -2091,9 +2237,6 @@ int main() {
         if (vkCreateDescriptorPool(device, &poolCI, nullptr, &descriptorPool) != VK_SUCCESS) {
             throw std::runtime_error("vkCreateDescriptorPool failed");
         }
-
-        AllocatedBuffer photonGridCountBuffer{};
-        AllocatedBuffer photonGridPhotonBuffer{};
 
         VkDescriptorSet computeSet = VK_NULL_HANDLE;
         {
@@ -2115,6 +2258,7 @@ int main() {
             VkDescriptorBufferInfo materialInfo{ materialBuffer.buffer, 0, VK_WHOLE_SIZE };
             VkDescriptorBufferInfo emissiveInfo{ emissiveTriBuffer.buffer, 0, VK_WHOLE_SIZE };
             VkDescriptorBufferInfo normalInfo{ normalBuffer.buffer, 0, VK_WHOLE_SIZE };
+            VkDescriptorBufferInfo transmissiveInfo{ transmissiveTriBuffer.buffer, 0, VK_WHOLE_SIZE };
 
             VkDescriptorImageInfo storageImageInfo{};
             storageImageInfo.imageView = tracedImageView;
@@ -2136,12 +2280,26 @@ int main() {
             depthStorageImageInfo.imageView = depthGuideImageView;
             depthStorageImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
+            VkDescriptorBufferInfo photonHitCounterInfo{};
+            photonHitCounterInfo.buffer = photonHitCounterBuffer.buffer;
+            photonHitCounterInfo.offset = 0;
+            photonHitCounterInfo.range = sizeof(uint32_t);
+
+            VkDescriptorBufferInfo photonHitInfo{};
+            photonHitInfo.buffer = photonHitBuffer.buffer;
+            photonHitInfo.offset = 0;
+            photonHitInfo.range = VK_WHOLE_SIZE;
+
+            VkDescriptorImageInfo causticsStorageImageInfo{};
+            causticsStorageImageInfo.imageView = causticsImageView;
+            causticsStorageImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
             VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
             asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
             asInfo.accelerationStructureCount = 1;
             asInfo.pAccelerationStructures = &tlas.handle;
 
-            std::array<VkWriteDescriptorSet, 14> writes{};
+            std::array<VkWriteDescriptorSet, 18> writes{};
 
             writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
             writes[0].dstSet = computeSet;
@@ -2241,21 +2399,101 @@ int main() {
             writes[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             writes[13].pImageInfo = &depthStorageImageInfo;
 
+            writes[14] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            writes[14].dstSet = computeSet;
+            writes[14].dstBinding = 14;
+            writes[14].descriptorCount = 1;
+            writes[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[14].pBufferInfo = &photonHitCounterInfo;
+
+            writes[15] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            writes[15].dstSet = computeSet;
+            writes[15].dstBinding = 15;
+            writes[15].descriptorCount = 1;
+            writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[15].pBufferInfo = &photonHitInfo;
+
+            writes[16] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            writes[16].dstSet = computeSet;
+            writes[16].dstBinding = 16;
+            writes[16].descriptorCount = 1;
+            writes[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[16].pBufferInfo = &transmissiveInfo;
+
+            writes[17] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            writes[17].dstSet = computeSet;
+            writes[17].dstBinding = 17;
+            writes[17].descriptorCount = 1;
+            writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[17].pImageInfo = &causticsStorageImageInfo;
+
             vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         }
 
-        recreatePhotonGridResources(
-            rtCtx,
-            device,
-            computeSet,
-            mesh,
-            renderSettings.causticGatherRad,
-            photonGrid,
-            gridCellCount,
-            maxPhotonsPerCell,
-            photonGridCountBuffer,
-            photonGridPhotonBuffer
-        );
+        VkDescriptorSet splatSet = VK_NULL_HANDLE;
+        {
+            VkDescriptorSetAllocateInfo ai{};
+            ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            ai.descriptorPool = descriptorPool;
+            ai.descriptorSetCount = 1;
+            ai.pSetLayouts = &splatSetLayout;
+
+            if (vkAllocateDescriptorSets(device, &ai, &splatSet) != VK_SUCCESS) {
+                throw std::runtime_error("vkAllocateDescriptorSets(splatSet) failed");
+            }
+
+            VkDescriptorBufferInfo frameInfo{ frameParamsBuffer.buffer, 0, sizeof(FrameParams) };
+
+            VkDescriptorBufferInfo photonHitCounterInfo{};
+            photonHitCounterInfo.buffer = photonHitCounterBuffer.buffer;
+            photonHitCounterInfo.offset = 0;
+            photonHitCounterInfo.range = sizeof(uint32_t);
+
+            VkDescriptorBufferInfo photonHitInfo{};
+            photonHitInfo.buffer = photonHitBuffer.buffer;
+            photonHitInfo.offset = 0;
+            photonHitInfo.range = VK_WHOLE_SIZE;
+
+            VkDescriptorImageInfo causticsInfo{};
+            causticsInfo.imageView = causticsImageView;
+            causticsInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            std::array<VkWriteDescriptorSet, 4> writes{};
+
+            writes[0] = {};
+            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[0].dstSet = splatSet;
+            writes[0].dstBinding = 0;
+            writes[0].descriptorCount = 1;
+            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            writes[0].pBufferInfo = &frameInfo;
+
+            writes[1] = {};
+            writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[1].dstSet = splatSet;
+            writes[1].dstBinding = 1;
+            writes[1].descriptorCount = 1;
+            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[1].pBufferInfo = &photonHitCounterInfo;
+
+            writes[2] = {};
+            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[2].dstSet = splatSet;
+            writes[2].dstBinding = 2;
+            writes[2].descriptorCount = 1;
+            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[2].pBufferInfo = &photonHitInfo;
+
+            writes[3] = {};
+            writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[3].dstSet = splatSet;
+            writes[3].dstBinding = 3;
+            writes[3].descriptorCount = 1;
+            writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[3].pImageInfo = &causticsInfo;
+
+            vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        }
 
         VkDescriptorSet denoiseSet = VK_NULL_HANDLE;
         {
@@ -2414,26 +2652,34 @@ int main() {
             ImGui_ImplGlfw_NewFrame();
             ImGui::NewFrame();
 
+            RenderSettings prevRenderSettings = renderSettings;
+            DenoiseParams prevDp = dp;
+
             bool materialChanged = drawMaterialEditor(mesh, selectedMaterial);
-            bool settingsChanged = drawRendererSettingsEditor(renderSettings);
+            bool clearCausticsPressed = false;
+
+            bool settingsChanged = drawRendererSettingsEditor(
+                renderSettings,
+                dp,
+                clearCausticsPressed,
+                causticAccumulatedPhotons,
+                causticFrameCounter
+            );
 
             ImGui::Render();
 
-            bool photonGridNeedsRebuild = false;
+            auto vec3Changed = [](const float a[3], const float b[3]) {
+                return a[0] != b[0] || a[1] != b[1] || a[2] != b[2];
+                };
 
-            if (std::abs(renderSettings.causticGatherRad - lastGatherRadius) > 1e-8f) {
-                photonGridNeedsRebuild = true;
-            }
+            bool gatherRadiusChanged =
+                prevRenderSettings.causticGatherRad != renderSettings.causticGatherRad;
 
-            SceneBounds currentBounds = computeSceneBounds(mesh);
-            if (currentBounds.minX != lastSceneBounds.minX ||
-                currentBounds.minY != lastSceneBounds.minY ||
-                currentBounds.minZ != lastSceneBounds.minZ ||
-                currentBounds.maxX != lastSceneBounds.maxX ||
-                currentBounds.maxY != lastSceneBounds.maxY ||
-                currentBounds.maxZ != lastSceneBounds.maxZ) {
-                photonGridNeedsRebuild = true;
-            }
+            bool sunChanged =
+                prevRenderSettings.sunEnabled != renderSettings.sunEnabled ||
+                prevRenderSettings.sunIntensity != renderSettings.sunIntensity ||
+                vec3Changed(prevRenderSettings.sunDirection, renderSettings.sunDirection) ||
+                vec3Changed(prevRenderSettings.sunColor, renderSettings.sunColor);
 
             bool cameraChanged = updateCameraFromInput(window, camera);
 
@@ -2487,12 +2733,63 @@ int main() {
                 write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                 write.pBufferInfo = &emissiveInfo;
 
+                transmissiveTriangles = buildTransmissiveTriangles(mesh);
+
+                destroyBuffer(rtCtx, transmissiveTriBuffer);
+
+                transmissiveTriBuffer = createBuffer(
+                    rtCtx,
+                    std::max<size_t>(sizeof(TransmissiveTriangle),
+                        sizeof(TransmissiveTriangle) * transmissiveTriangles.size()),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+                );
+
+                if (!transmissiveTriangles.empty()) {
+                    uploadToBuffer(
+                        rtCtx,
+                        transmissiveTriangles.data(),
+                        sizeof(TransmissiveTriangle) * transmissiveTriangles.size(),
+                        transmissiveTriBuffer
+                    );
+                }
+
+                VkDescriptorBufferInfo transmissiveInfo{};
+                transmissiveInfo.buffer = transmissiveTriBuffer.buffer;
+                transmissiveInfo.offset = 0;
+                transmissiveInfo.range = VK_WHOLE_SIZE;
+
+                VkWriteDescriptorSet transmissiveWrite{};
+                transmissiveWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                transmissiveWrite.dstSet = computeSet;
+                transmissiveWrite.dstBinding = 16;
+                transmissiveWrite.descriptorCount = 1;
+                transmissiveWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                transmissiveWrite.pBufferInfo = &transmissiveInfo;
+
+                vkUpdateDescriptorSets(device, 1, &transmissiveWrite, 0, nullptr);
+
                 vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 
                 accumulationFrameIndex = 0;
             }
 
+            if (causticCacheClearRequested) {
+                causticAccumulatedPhotons = 0;
+            }
+
             Vec3 whiteBalance = whiteBalanceRGB();
+
+            uint32_t photonsPerFrame =
+                static_cast<uint32_t>(std::max(renderSettings.causticPhotonsPerFrame, 0));
+
+            uint32_t totalPhotonsAfterDispatch = causticAccumulatedPhotons;
+            if (UINT32_MAX - totalPhotonsAfterDispatch < photonsPerFrame) {
+                totalPhotonsAfterDispatch = UINT32_MAX;
+            }
+            else {
+                totalPhotonsAfterDispatch += photonsPerFrame;
+            }
 
             FrameParams fp{};
             fp.width = extent.width;
@@ -2501,25 +2798,35 @@ int main() {
             fp.frameIndex = renderSettings.accumulate ? accumulationFrameIndex : 0u;
 
             fp.emissiveTriangleCount = static_cast<uint32_t>(emissiveTriangles.size());
+            fp.transmissiveTriangleCount = static_cast<uint32_t>(transmissiveTriangles.size());
             fp.sunEnabled = renderSettings.sunEnabled ? 1u : 0u;
             fp.fogEnabled = renderSettings.fogEnabled ? 1u : 0u;
             fp.maxBounces = static_cast<uint32_t>(renderSettings.maxBounces);
 
-            constexpr uint32_t PHOTON_THREADS = 4194304;
-
             fp.misc[0] = renderSettings.causticStrength;
             fp.misc[1] = renderSettings.causticGatherRad;
             fp.misc[2] = renderSettings.wavelengthBandwidth;
-            fp.misc[3] = static_cast<float>(PHOTON_THREADS);
+            fp.misc[3] = 0.0f;
 
-            std::memcpy(fp.gridMin, photonGrid.minBounds, sizeof(fp.gridMin));
-            std::memcpy(fp.gridMax, photonGrid.maxBounds, sizeof(fp.gridMax));
-            std::memcpy(fp.gridRes, photonGrid.res, sizeof(fp.gridRes));
+            fp.misc2[0] = static_cast<float>(renderSettings.causticBounces);
+            fp.misc2[1] = 0.0f;
+            fp.misc2[2] = 0.0f;
+            fp.misc2[3] = sceneExtent;
+
+            fp.causticState[0] = photonsPerFrame;
+            fp.causticState[1] = causticFrameCounter;
+            fp.causticState[2] = totalPhotonsAfterDispatch;
+            fp.causticState[3] = 0u;
 
             fp.whiteBalance[0] = whiteBalance.x;
             fp.whiteBalance[1] = whiteBalance.y;
             fp.whiteBalance[2] = whiteBalance.z;
-            fp.whiteBalance[3] = 1.0;
+            fp.whiteBalance[3] = 1.0f;
+
+            fp.photonHitCapacity = static_cast<uint32_t>(renderSettings.causticPhotonsPerFrame);
+            fp.photonPad0 = 0u;
+            fp.photonPad1 = 0u;
+            fp.photonPad2 = 0u;
 
             float sx = renderSettings.sunDirection[0];
             float sy = renderSettings.sunDirection[1];
@@ -2556,25 +2863,6 @@ int main() {
 
             vkWaitForFences(device, 1, &inFlight, VK_TRUE, UINT64_MAX);
             vkResetFences(device, 1, &inFlight);
-
-            if (photonGridNeedsRebuild) {
-                recreatePhotonGridResources(
-                    rtCtx,
-                    device,
-                    computeSet,
-                    mesh,
-                    renderSettings.causticGatherRad,
-                    photonGrid,
-                    gridCellCount,
-                    maxPhotonsPerCell,
-                    photonGridCountBuffer,
-                    photonGridPhotonBuffer
-                );
-
-                lastGatherRadius = renderSettings.causticGatherRad;
-                lastSceneBounds = currentBounds;
-                accumulationFrameIndex = 0;
-            }
 
             uint32_t imageIndex = 0;
             VkResult acquire = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, imageAvailable, VK_NULL_HANDLE, &imageIndex);
@@ -2681,41 +2969,60 @@ int main() {
             depthToGeneral.srcAccessMask = 0;
             depthToGeneral.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 
+            VkImageMemoryBarrier causticsToGeneral{};
+            causticsToGeneral.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            causticsToGeneral.oldLayout =
+                (accumulationFrameIndex == 0)
+                ? VK_IMAGE_LAYOUT_UNDEFINED
+                : VK_IMAGE_LAYOUT_GENERAL;
+            causticsToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            causticsToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            causticsToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            causticsToGeneral.image = causticsImage;
+            causticsToGeneral.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            causticsToGeneral.subresourceRange.baseMipLevel = 0;
+            causticsToGeneral.subresourceRange.levelCount = 1;
+            causticsToGeneral.subresourceRange.baseArrayLayer = 0;
+            causticsToGeneral.subresourceRange.layerCount = 1;
+            causticsToGeneral.srcAccessMask = 0;
+            causticsToGeneral.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+
             VkImageMemoryBarrier toGeneralBarriers[] = {
                 tracedToGeneral,
                 accumToGeneral,
                 albedoToGeneral,
                 normalToGeneral,
-                depthToGeneral
+                depthToGeneral,
+                causticsToGeneral
             };
 
             vkCmdPipelineBarrier(
                 cmd,
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 0,
                 0, nullptr,
                 0, nullptr,
-                5, toGeneralBarriers
+                6, toGeneralBarriers
             );
 
             vkCmdFillBuffer(
                 cmd,
-                photonGridCountBuffer.buffer,
+                photonHitCounterBuffer.buffer,
                 0,
-                sizeof(uint32_t)* gridCellCount,
+                sizeof(uint32_t),
                 0
             );
 
-            VkBufferMemoryBarrier gridCountClearBarrier{};
-            gridCountClearBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            gridCountClearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            gridCountClearBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            gridCountClearBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            gridCountClearBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            gridCountClearBarrier.buffer = photonGridCountBuffer.buffer;
-            gridCountClearBarrier.offset = 0;
-            gridCountClearBarrier.size = VK_WHOLE_SIZE;
+            VkBufferMemoryBarrier hitCounterClearBarrier{};
+            hitCounterClearBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            hitCounterClearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            hitCounterClearBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            hitCounterClearBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            hitCounterClearBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            hitCounterClearBarrier.buffer = photonHitCounterBuffer.buffer;
+            hitCounterClearBarrier.offset = 0;
+            hitCounterClearBarrier.size = sizeof(uint32_t);
 
             vkCmdPipelineBarrier(
                 cmd,
@@ -2723,43 +3030,44 @@ int main() {
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 0,
                 0, nullptr,
-                1, &gridCountClearBarrier,
+                1, &hitCounterClearBarrier,
                 0, nullptr
             );
 
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, photonPipeline);
-            vkCmdBindDescriptorSets(
-                cmd,
-                VK_PIPELINE_BIND_POINT_COMPUTE,
-                computePipelineLayout,
-                0,
-                1,
-                &computeSet,
-                0,
-                nullptr
-            );
+            if (photonsPerFrame > 0) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, photonPipeline);
+                vkCmdBindDescriptorSets(
+                    cmd,
+                    VK_PIPELINE_BIND_POINT_COMPUTE,
+                    computePipelineLayout,
+                    0,
+                    1,
+                    &computeSet,
+                    0,
+                    nullptr
+                );
+                vkCmdDispatch(cmd, (photonsPerFrame + 63) / 64, 1, 1);
+            }
 
-            vkCmdDispatch(cmd, (PHOTON_THREADS + 63) / 64, 1, 1);
+            VkBufferMemoryBarrier photonHitBarriers[2]{};
 
-            VkBufferMemoryBarrier photonGridBarrier[2]{};   
+            photonHitBarriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            photonHitBarriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            photonHitBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            photonHitBarriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            photonHitBarriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            photonHitBarriers[0].buffer = photonHitCounterBuffer.buffer;
+            photonHitBarriers[0].offset = 0;
+            photonHitBarriers[0].size = sizeof(uint32_t);
 
-            photonGridBarrier[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            photonGridBarrier[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            photonGridBarrier[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            photonGridBarrier[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            photonGridBarrier[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            photonGridBarrier[0].buffer = photonGridCountBuffer.buffer;
-            photonGridBarrier[0].offset = 0;
-            photonGridBarrier[0].size = VK_WHOLE_SIZE;
-
-            photonGridBarrier[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            photonGridBarrier[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            photonGridBarrier[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            photonGridBarrier[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            photonGridBarrier[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            photonGridBarrier[1].buffer = photonGridPhotonBuffer.buffer;
-            photonGridBarrier[1].offset = 0;
-            photonGridBarrier[1].size = VK_WHOLE_SIZE;
+            photonHitBarriers[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            photonHitBarriers[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            photonHitBarriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            photonHitBarriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            photonHitBarriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            photonHitBarriers[1].buffer = photonHitBuffer.buffer;
+            photonHitBarriers[1].offset = 0;
+            photonHitBarriers[1].size = VK_WHOLE_SIZE;
 
             vkCmdPipelineBarrier(
                 cmd,
@@ -2767,8 +3075,70 @@ int main() {
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 0,
                 0, nullptr,
-                2, photonGridBarrier,
+                2, photonHitBarriers,
                 0, nullptr
+            );
+
+            VkClearColorValue zeroClear{};
+            zeroClear.float32[0] = 0.0f;
+            zeroClear.float32[1] = 0.0f;
+            zeroClear.float32[2] = 0.0f;
+            zeroClear.float32[3] = 0.0f;
+
+            VkImageSubresourceRange fullRange{};
+            fullRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            fullRange.baseMipLevel = 0;
+            fullRange.levelCount = 1;
+            fullRange.baseArrayLayer = 0;
+            fullRange.layerCount = 1;
+
+            vkCmdClearColorImage(
+                cmd,
+                causticsImage,
+                VK_IMAGE_LAYOUT_GENERAL,
+                &zeroClear,
+                1,
+                &fullRange
+            );
+
+            if (photonsPerFrame > 0) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, splatPipeline);
+                vkCmdBindDescriptorSets(
+                    cmd,
+                    VK_PIPELINE_BIND_POINT_COMPUTE,
+                    splatPipelineLayout,
+                    0,
+                    1,
+                    &splatSet,
+                    0,
+                    nullptr
+                );
+                vkCmdDispatch(cmd, (renderSettings.causticPhotonsPerFrame + 63) / 64, 1, 1);
+            }
+
+            VkImageMemoryBarrier causticsForShading{};
+            causticsForShading.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            causticsForShading.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            causticsForShading.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            causticsForShading.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            causticsForShading.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            causticsForShading.image = causticsImage;
+            causticsForShading.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            causticsForShading.subresourceRange.baseMipLevel = 0;
+            causticsForShading.subresourceRange.levelCount = 1;
+            causticsForShading.subresourceRange.baseArrayLayer = 0;
+            causticsForShading.subresourceRange.layerCount = 1;
+            causticsForShading.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            causticsForShading.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0, nullptr,
+                0, nullptr,
+                1, &causticsForShading
             );
 
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
@@ -2966,6 +3336,10 @@ int main() {
             if (vkQueuePresentKHR(presentQueue, &present) != VK_SUCCESS) {
                 throw std::runtime_error("vkQueuePresentKHR failed");
             }
+
+            causticAccumulatedPhotons = totalPhotonsAfterDispatch;
+            causticFrameCounter++;
+            causticCacheClearRequested = false;
         }
 
         vkDeviceWaitIdle(device);
@@ -2987,12 +3361,8 @@ int main() {
         destroyBuffer(rtCtx, pathBuffer);
         destroyBuffer(rtCtx, frameParamsBuffer);
         destroyBuffer(rtCtx, denoiseParamsBuffer);
-        if (photonGridCountBuffer.buffer != VK_NULL_HANDLE) {
-            destroyBuffer(rtCtx, photonGridCountBuffer);
-        }
-        if (photonGridPhotonBuffer.buffer != VK_NULL_HANDLE) {
-            destroyBuffer(rtCtx, photonGridPhotonBuffer);
-        }
+        destroyBuffer(rtCtx, transmissiveTriBuffer);
+        destroyBuffer(rtCtx, emissiveTriBuffer);
 
         vkDestroySampler(device, presentSampler, nullptr);
         vkDestroyImageView(device, tracedImageView, nullptr);

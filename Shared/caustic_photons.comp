@@ -20,19 +20,25 @@ struct Material {
 };
 
 struct EmissiveTriangle {
-    uvec4 triIndex_pad;
-    vec4 area_pmf_cdf_pad;
+    uvec4 triIndex_pad;          // x = triIndex
+    vec4 area_pmf_cdf_pad;       // x = area, y = pmf, z = cdf
 };
 
-struct CausticPhoton {
-    vec4 pos_radius;   // xyz = receiver hit position, w = gather radius used at store time
-    vec4 wi_lambda;    // xyz = photon travel dir toward receiver, w = lambda
-    vec4 power_pad;    // x = scalar flux
+struct TransmissiveTriangle {
+    uvec4 triIndex_pad;          // x = triIndex
+    vec4 area_pmf_cdf_pad;       // x = area, y = pmf, z = cdf
+};
+
+struct CausticPhotonHit {
+    vec4 pos_power;   // xyz = world hit pos, w = scalar flux/power
+    vec4 wi_lambda;   // xyz = incoming dir at receiver, w = wavelength nm
+    vec4 axis0_len;   // xyz = footprint axis0 in world space, w = length
+    vec4 axis1_len;   // xyz = footprint axis1 in world space, w = length
 };
 
 layout(std140, binding = 0) uniform FrameParams {
-    uvec4 screen;
-    uvec4 extra;
+    uvec4 screen;    // x=width, y=height, z=pathCount, w=frameIndex
+    uvec4 extra;     // x=emissiveTriangleCount, y=sunEnabled, z=fogEnabled, w=maxBounces
 
     vec4 camPos;
     vec4 camForward;
@@ -44,12 +50,18 @@ layout(std140, binding = 0) uniform FrameParams {
     vec4 sunColor;
     vec4 fogParams;
 
-    vec4 misc;
+    vec4 misc;       // x=causticStrength, y=gatherRadius, z=wavelengthBandwidth, w=unused
+    vec4 misc2;      // x=causticBounces, y,z unused, w=sceneExtent
+    uvec4 causticState; // x=photonsPerFrame, y=causticFrameCounter, z=accumulatedPhotonCountAfterDispatch, w=unused
+
+    uvec4 transmissiveTriangleCount; // x=count
+
     vec4 whiteBalance;
 
-    vec4 gridMin;
-    vec4 gridMax;
-    uvec4 gridRes;
+    uint photonHitCapacity;
+    uint photonPad0;
+    uint photonPad1;
+    uint photonPad2;
 } frame;
 
 layout(binding = 4) uniform accelerationStructureEXT sceneTLAS;
@@ -78,12 +90,16 @@ layout(std430, binding = 10) readonly buffer NormalBuffer {
     float normalData[];
 };
 
-layout(std430, binding = 14) buffer PhotonGridCountBuffer {
-    uint photonGridCounts[];
+layout(std430, binding = 14) buffer PhotonHitCounterBuffer {
+    uint photonHitCount;
 };
 
-layout(std430, binding = 15) buffer PhotonGridPhotonBuffer {
-    CausticPhoton photonGridPhotons[];
+layout(std430, binding = 15) buffer PhotonHitBuffer {
+    CausticPhotonHit photonHits[];
+};
+
+layout(std430, binding = 16) readonly buffer TransmissiveTriBuffer {
+    TransmissiveTriangle transmissiveTriangles[];
 };
 
 uint hash_u32(uint x) {
@@ -106,9 +122,9 @@ float gauss1(float x, float mu, float sigma) {
 }
 
 float rgb_to_spectrum_unit(float lambda, vec3 rgb) {
-    float Sr = exp(-((lambda - 610.0) / 60.0) * ((lambda - 610.0) / 60.0));
-    float Sg = exp(-((lambda - 540.0) / 60.0) * ((lambda - 540.0) / 60.0));
-    float Sb = exp(-((lambda - 460.0) / 30.0) * ((lambda - 460.0) / 30.0));
+    float Sr = exp(-((lambda - 610.0) / 35.0) * ((lambda - 610.0) / 35.0));
+    float Sg = exp(-((lambda - 540.0) / 30.0) * ((lambda - 540.0) / 30.0));
+    float Sb = exp(-((lambda - 460.0) / 20.0) * ((lambda - 460.0) / 20.0));
 
     float denom = max(Sr + Sg + Sb, 1e-6);
     vec3 c = max(rgb, vec3(0.0));
@@ -133,83 +149,19 @@ float rgb_to_reflectance_spectrum(float lambda, vec3 rgb) {
     return clamp(m * s, 0.0, 0.999);
 }
 
-uvec3 photonGridRes3() {
-    return uvec3(frame.gridRes.x, frame.gridRes.y, frame.gridRes.z);
-}
-
-uint photonGridMaxPerCell() {
-    return frame.gridRes.w;
-}
-
-vec3 photonGridMin3() {
-    return frame.gridMin.xyz;
-}
-
-vec3 photonGridMax3() {
-    return frame.gridMax.xyz;
-}
-
-vec3 photonGridCellSize() {
-    vec3 ext = photonGridMax3() - photonGridMin3();
-    return ext / max(vec3(photonGridRes3()), vec3(1.0));
-}
-
-bool pointInsidePhotonGrid(vec3 p) {
-    return all(greaterThanEqual(p, photonGridMin3())) &&
-           all(lessThanEqual(p, photonGridMax3()));
-}
-
-uvec3 pointToPhotonGridCell(vec3 p) {
-    vec3 rel = (p - photonGridMin3()) / max(photonGridCellSize(), vec3(1e-8));
-    vec3 clamped = clamp(rel, vec3(0.0), vec3(photonGridRes3()) - vec3(1e-4));
-    return uvec3(clamped);
-}
-
-uint flattenPhotonGridCell(uvec3 c) {
-    uvec3 r = photonGridRes3();
-    return c.x + r.x * (c.y + r.y * c.z);
-}
-
-uint photonGridLinearIndex(uint cellIndex, uint slot) {
-    return cellIndex * photonGridMaxPerCell() + slot;
-}
-
-void storePhotonInUniformGrid(
-    vec3 receiverPos,
-    vec3 photonTravelDir,
-    float lambda,
-    float power
-) {
-    if (!pointInsidePhotonGrid(receiverPos)) {
-        return;
-    }
-
-    uvec3 cell = pointToPhotonGridCell(receiverPos);
-    uint cellIndex = flattenPhotonGridCell(cell);
-
-    uint slot = atomicAdd(photonGridCounts[cellIndex], 1u);
-    uint maxPerCell = photonGridMaxPerCell();
-
-    if (slot >= maxPerCell) {
-        // overflow: silently drop
-        return;
-    }
-
-    uint idx = photonGridLinearIndex(cellIndex, slot);
-
-    photonGridPhotons[idx].pos_radius = vec4(receiverPos, frame.misc.y);
-    photonGridPhotons[idx].wi_lambda  = vec4(photonTravelDir, lambda);
-    photonGridPhotons[idx].power_pad  = vec4(power, 0.0, 0.0, 0.0);
+float sigmaAFromColor(float lambda, vec3 color) {
+    float t = clamp(rgb_to_reflectance_spectrum(lambda, color), 1e-4, 0.9999);
+    return -log(t);
 }
 
 vec3 loadVertex(uint vertexIndex) {
     uint base = vertexIndex * 3u;
-    return vec3(vertexData[base+0u], vertexData[base+1u], vertexData[base+2u]);
+    return vec3(vertexData[base + 0u], vertexData[base + 1u], vertexData[base + 2u]);
 }
 
 vec3 loadNormal(uint vertexIndex) {
     uint base = vertexIndex * 3u;
-    return vec3(normalData[base+0u], normalData[base+1u], normalData[base+2u]);
+    return vec3(normalData[base + 0u], normalData[base + 1u], normalData[base + 2u]);
 }
 
 void loadTriangle(uint triIndex, out vec3 v0, out vec3 v1, out vec3 v2) {
@@ -253,6 +205,14 @@ uint sampleEmissiveTriangle(float xi) {
     uint count = frame.extra.x;
     for (uint i = 0u; i < count; ++i) {
         if (xi <= emissiveTriangles[i].area_pmf_cdf_pad.z) return i;
+    }
+    return count - 1u;
+}
+
+uint sampleTransmissiveTriangle(float xi) {
+    uint count = frame.transmissiveTriangleCount.x;
+    for (uint i = 0u; i < count; ++i) {
+        if (xi <= transmissiveTriangles[i].area_pmf_cdf_pad.z) return i;
     }
     return count - 1u;
 }
@@ -324,147 +284,237 @@ float iorAtLambda(float iorD, float dispersionStrength, float lambdaNm) {
     return A + B / (lambda * lambda);
 }
 
+vec3 interpolateSmoothNormal(uint triIndex, vec2 bary, vec3 flatN) {
+    uint i0 = indexData[triIndex * 3u + 0u];
+    uint i1 = indexData[triIndex * 3u + 1u];
+    uint i2 = indexData[triIndex * 3u + 2u];
+
+    vec3 n0 = loadNormal(i0);
+    vec3 n1 = loadNormal(i1);
+    vec3 n2 = loadNormal(i2);
+
+    float b0 = 1.0 - bary.x - bary.y;
+    float b1 = bary.x;
+    float b2 = bary.y;
+
+    vec3 Ns = normalize(n0 * b0 + n1 * b1 + n2 * b2);
+    if (dot(Ns, flatN) < 0.0) Ns = -Ns;
+    return Ns;
+}
+
+bool findReceiverHit(
+    vec3 ro,
+    vec3 rd,
+    out uint triIndex,
+    out vec3 hitPos,
+    out vec3 Ng,
+    out vec3 Ns,
+    out Material mat,
+    out vec2 bary
+) {
+    float tHit;
+    if (!traceClosest(ro, rd, triIndex, tHit, bary)) return false;
+
+    hitPos = ro + rd * tHit;
+
+    vec3 v0, v1, v2;
+    loadTriangle(triIndex, v0, v1, v2);
+    Ng = triangleNormal(v0, v1, v2);
+
+    uint matIndex = triangleMaterialIndices[triIndex];
+    mat = materials[matIndex];
+
+    bool smoothShading = mat.metallic_smoothShading_transmission_ior.y > 0.5;
+    Ns = smoothShading ? interpolateSmoothNormal(triIndex, bary, Ng) : Ng;
+
+    if (dot(Ns, -rd) < 0.0) Ns = -Ns;
+    if (dot(Ng, -rd) < 0.0) Ng = -Ng;
+
+    return true;
+}
+
+bool isReceiverMaterial(Material mat) {
+    float transmission = mat.metallic_smoothShading_transmission_ior.z;
+    float emissiveIntensity = mat.emissive_emissiveIntensity.w;
+    return transmission <= 0.001 && emissiveIntensity <= 0.0;
+}
+
+bool isValidCausticTransmissive(Material mat) {
+    float transmission = mat.metallic_smoothShading_transmission_ior.z;
+    float smoothness   = mat.albedo_smoothness.w;
+    return transmission > 0.001 && smoothness > 0.98;
+}
+
+void storePhotonHit(
+    vec3 hitPos,
+    vec3 wi,
+    vec3 Ns,
+    float flux,
+    float lambda
+) {
+    uint idx = atomicAdd(photonHitCount, 1u);
+    if (idx >= frame.photonHitCapacity) {
+        return;
+    }
+
+    vec3 T, B;
+    makeBasis(Ns, T, B);
+
+    float r = max(frame.misc.y, 1e-4);
+
+    photonHits[idx].pos_power = vec4(hitPos, flux);
+    photonHits[idx].wi_lambda = vec4(normalize(wi), lambda);
+    photonHits[idx].axis0_len = vec4(T * r, r);
+    photonHits[idx].axis1_len = vec4(B * r, r);
+}
+
 void main() {
     uint photonIndex = gl_GlobalInvocationID.x;
-    uint maxPhotons = uint(frame.misc.w);
+    uint maxPhotons = frame.causticState.x;
     if (photonIndex >= maxPhotons) return;
     if (frame.extra.x == 0u) return;
 
-    uint rng = photonIndex * 9781u + frame.screen.w * 6271u + 17u;
+    uint rng =
+        photonIndex * 9781u +
+        frame.causticState.y * 6271u +
+        17u;
 
     float uLambda = rand01(rng);
     float lambda = mix(LAMBDA_MIN, LAMBDA_MAX, uLambda);
 
-    uint lightSlot = sampleEmissiveTriangle(rand01(rng));
-    uint triIndex = emissiveTriangles[lightSlot].triIndex_pad.x;
-    float lightArea = emissiveTriangles[lightSlot].area_pmf_cdf_pad.x;
-    float lightPmf  = emissiveTriangles[lightSlot].area_pmf_cdf_pad.y;
-
-    if (lightArea <= 0.0 || lightPmf <= 0.0) return;
+    uint lightIdx = sampleEmissiveTriangle(rand01(rng));
+    uint lightTri = emissiveTriangles[lightIdx].triIndex_pad.x;
+    float lightPMF = max(emissiveTriangles[lightIdx].area_pmf_cdf_pad.y, 1e-12);
 
     vec3 v0, v1, v2;
-    loadTriangle(triIndex, v0, v1, v2);
-    vec3 lightN = triangleNormal(v0, v1, v2);
+    loadTriangle(lightTri, v0, v1, v2);
 
-    vec2 buv = sampleUniformTriangle(vec2(rand01(rng), rand01(rng)));
-    float b0 = 1.0 - buv.x - buv.y;
-    float b1 = buv.x;
-    float b2 = buv.y;
-    vec3 p = v0 * b0 + v1 * b1 + v2 * b2;
+    vec2 ub = sampleUniformTriangle(vec2(rand01(rng), rand01(rng)));
+    float b0 = ub.x;
+    float b1 = ub.y;
+    float b2 = 1.0 - b0 - b1;
 
-    vec3 dir = sampleCosineHemisphere(lightN, vec2(rand01(rng), rand01(rng)));
-    float cosLight = max(dot(lightN, dir), 0.0);
-    if (cosLight <= 0.0) return;
+    vec3 lightPos = v0 * b0 + v1 * b1 + v2 * b2;
+    vec3 lightNg = triangleNormal(v0, v1, v2);
 
-    uint matIndex = triangleMaterialIndices[triIndex];
-    Material lightMat = materials[matIndex];
-    vec3 LeRGB = lightMat.emissive_emissiveIntensity.xyz * lightMat.emissive_emissiveIntensity.w;
-    float LeS = rgb_to_emission_spectrum(lambda, LeRGB);
-    if (LeS <= 0.0) return;
+    uint lightMatIndex = triangleMaterialIndices[lightTri];
+    Material lightMat = materials[lightMatIndex];
 
-    float pdfPos = lightPmf / lightArea;
-    float pdfDir = cosLight / PI;
-    float power = LeS * cosLight / max(pdfPos * pdfDir, 1e-8);
+    vec3 LeRgb =
+        lightMat.emissive_emissiveIntensity.rgb *
+        lightMat.emissive_emissiveIntensity.w;
 
-    vec3 ro = p + dir * EPS;
-    vec3 rd = dir;
+    float Le = rgb_to_emission_spectrum(lambda, LeRgb);
+    if (Le <= 0.0) return;
 
-    bool hadSpecular = false;
+    vec3 emitDir = sampleCosineHemisphere(lightNg, vec2(rand01(rng), rand01(rng)));
 
-    for (uint bounce = 0u; bounce < 8u; ++bounce) {
-        uint prim;
+    float triArea = emissiveTriangles[lightIdx].area_pmf_cdf_pad.x;
+    float flux = Le * triArea * PI / lightPMF;
+
+    vec3 ro = lightPos + lightNg * EPS;
+    vec3 rd = emitDir;
+
+    uint maxBounces = uint(max(frame.misc2.x, 0.0));
+
+    bool insideMedium = false;
+    float sigmaA = 0.0;
+    float currentEta = 1.0;
+
+    for (uint bounce = 0u; bounce < maxBounces; ++bounce) {
+        uint triIndex;
         float tHit;
         vec2 bary;
-        if (!traceClosest(ro, rd, prim, tHit, bary)) return;
+
+        if (!traceClosest(ro, rd, triIndex, tHit, bary)) {
+            return;
+        }
+
+        if (insideMedium) {
+            flux *= exp(-sigmaA * tHit);
+            if (flux <= 1e-8) {
+                return;
+            }
+        }
 
         vec3 hitPos = ro + rd * tHit;
 
         vec3 tv0, tv1, tv2;
-        loadTriangle(prim, tv0, tv1, tv2);
-        vec3 geomN = triangleNormal(tv0, tv1, tv2);
+        loadTriangle(triIndex, tv0, tv1, tv2);
+        vec3 Ng = triangleNormal(tv0, tv1, tv2);
 
-        uint i0 = indexData[prim * 3u + 0u];
-        uint i1 = indexData[prim * 3u + 1u];
-        uint i2 = indexData[prim * 3u + 2u];
+        uint matIndex = triangleMaterialIndices[triIndex];
+        Material mat = materials[matIndex];
 
-        float u = bary.x;
-        float v = bary.y;
-        float w = 1.0 - u - v;
+        bool smoothShading = mat.metallic_smoothShading_transmission_ior.y > 0.5;
+        vec3 Ns = smoothShading ? interpolateSmoothNormal(triIndex, bary, Ng) : Ng;
 
-        Material mat = materials[triangleMaterialIndices[prim]];
+        if (dot(Ng, -rd) < 0.0) Ng = -Ng;
+        if (dot(Ns, -rd) < 0.0) Ns = -Ns;
+
         float transmission = mat.metallic_smoothShading_transmission_ior.z;
-        float metallic = mat.metallic_smoothShading_transmission_ior.x;
-        float smoothness = mat.albedo_smoothness.w;
-        float smoothShading = mat.metallic_smoothShading_transmission_ior.y;
+        float smoothness   = mat.albedo_smoothness.w;
+        float iorD         = mat.metallic_smoothShading_transmission_ior.w;
+        float dispersion   = mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x;
 
-        vec3 n0 = loadNormal(i0);
-        vec3 n1 = loadNormal(i1);
-        vec3 n2 = loadNormal(i2);
-        vec3 smoothN = normalize(n0 * w + n1 * u + n2 * v);
-
-        bool frontFace = dot(rd, geomN) < 0.0;
-        vec3 Ng = frontFace ? geomN : -geomN;
-        vec3 rawShadeN = (smoothShading > 0.5) ? smoothN : Ng;
-        vec3 Ns = normalize(dot(rawShadeN, Ng) >= 0.0 ? rawShadeN : -rawShadeN);
-
-        vec3 V = normalize(-rd);
-
-        float sigmaA = 0.0;
-        if (frontFace) {
-            sigmaA = 0.0;
-        } else {
-            sigmaA = -log(max(rgb_to_reflectance_spectrum(lambda, mat.albedo_smoothness.xyz), 1e-3));
-        }
-
-        if (!frontFace && transmission > 0.001) {
-            float transmittance = exp(-sigmaA * tHit);
-            power *= transmittance;
-        }
-
-        bool specReceiver =
-            (transmission > 0.001 && isDeltaSpecular(smoothness)) ||
-            (transmission <= 0.001 && metallic > 0.999 && isDeltaSpecular(smoothness));
-
-        if (!specReceiver) {
-            if (hadSpecular && transmission <= 0.001) {
-                storePhotonInUniformGrid(hitPos, rd, lambda, power);
-            }
+        if (bounce > 0u && transmission <= 0.001) {
+            vec3 wi = -rd;
+            storePhotonHit(hitPos, wi, Ns, flux, lambda);
             return;
         }
 
-        if (transmission > 0.001) {
-            float ior = iorAtLambda(
-                mat.metallic_smoothShading_transmission_ior.w,
-                mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x,
-                lambda
-            );
-
-            float etaI = frontFace ? 1.0 : ior;
-            float etaT = frontFace ? ior : 1.0;
-            float Fr = fresnelDielectric(clamp(dot(V, Ns), 0.0, 1.0), etaI, etaT);
-
-            vec3 newDir;
-            if (rand01(rng) < Fr) {
-                newDir = reflect(-V, Ns);
-                power *= Fr;
-            } else {
-                if (!refractDir(-V, Ns, etaI / etaT, newDir)) {
-                    newDir = reflect(-V, Ns);
-                } else {
-                    power *= max(1.0 - Fr, 1e-3);
-                }
-            }
-
-            hadSpecular = true;
-            vec3 pushNg = dot(newDir, Ng) >= 0.0 ? Ng : -Ng;
-            ro = hitPos + pushNg * EPS + newDir * EPS;
-            rd = normalize(newDir);
-        } else {
-            vec3 newDir = reflect(-V, Ns);
-            hadSpecular = true;
-            vec3 pushNg = dot(newDir, Ng) >= 0.0 ? Ng : -Ng;
-            ro = hitPos + pushNg * EPS + newDir * EPS;
-            rd = normalize(newDir);
+        if (!(transmission > 0.001 && smoothness > 0.98)) {
+            return;
         }
+
+        float etaMat = iorAtLambda(iorD, dispersion, lambda);
+
+        vec3 N = Ns;
+        bool entering = dot(rd, N) < 0.0;
+
+        float etaI = entering ? 1.0 : etaMat;
+        float etaT = entering ? etaMat : 1.0;
+
+        if (!entering) {
+            N = -N;
+        }
+
+        float Fr = fresnelDielectric(abs(dot(-rd, N)), etaI, etaT);
+
+        vec3 refrDir;
+        bool canRefract = refractDir(rd, N, etaI / etaT, refrDir);
+
+        vec3 newDir;
+        bool tookTransmission = false;
+
+        if (!canRefract) {
+            newDir = normalize(reflect(rd, N));
+        } else {
+            if (rand01(rng) < Fr) {
+                newDir = normalize(reflect(rd, N));
+                flux *= Fr;
+            } else {
+                newDir = normalize(refrDir);
+                flux *= (1.0 - Fr);
+                tookTransmission = true;
+            }
+        }
+
+        if (flux <= 1e-8) {
+            return;
+        }
+
+        if (tookTransmission) {
+            if (entering) {
+                insideMedium = true;
+                sigmaA = sigmaAFromColor(lambda, mat.albedo_smoothness.rgb);
+            } else {
+                insideMedium = false;
+                sigmaA = 0.0;
+            }
+        }
+
+        ro = hitPos + newDir * EPS;
+        rd = normalize(newDir);
     }
 }

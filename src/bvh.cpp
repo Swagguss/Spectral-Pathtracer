@@ -6,12 +6,6 @@
 #include <vector>
 
 namespace {
-
-    struct Aabb {
-        float minX, minY, minZ;
-        float maxX, maxY, maxZ;
-    };
-
     struct TriRef {
         uint32_t triId;
         float cx, cy, cz;
@@ -180,6 +174,7 @@ namespace {
         FlattenedBvh& out
     ) {
         const BuildNode& src = buildNodes[buildNodeIndex];
+        out.bounds = src.bounds;
 
         const int flatIndex = static_cast<int>(out.nodes.size());
         out.nodes.push_back({});

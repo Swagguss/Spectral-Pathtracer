@@ -2,7 +2,7 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-// binding 0 = noisy input color
+// binding 0 = input color
 layout(binding = 0, rgba32f) uniform readonly image2D inColor;
 
 // binding 1 = albedo guide
@@ -22,6 +22,8 @@ layout(std140, binding = 5) uniform DenoiseParams {
     vec4 sigma;             // x = colorSigma, y = normalSigma, z = depthSigma, w = albedoSigma
 } params;
 
+const float EPS = 1e-6;
+
 float saturate(float x) {
     return clamp(x, 0.0, 1.0);
 }
@@ -40,10 +42,26 @@ vec3 decodeNormal(vec3 n) {
     return n * inversesqrt(len2);
 }
 
-float spatialWeight(ivec2 o, int stepRadius) {
-    vec2 p = vec2(o) / max(float(stepRadius), 1.0);
-    float r2 = dot(p, p);
-    return exp(-0.5 * r2);
+bool validDepth(float d) {
+    return (d > 0.0 && d < 1e29);
+}
+
+vec3 safeAlbedo(vec3 a) {
+    return max(a, vec3(0.04));
+}
+
+float gaussian1(float x, float sigma) {
+    float s = max(sigma, 1e-6);
+    return safeExp(-0.5 * (x * x) / (s * s));
+}
+
+// 1d a-trous kernel
+// 1  4  6  4 1
+float kernelWeight1D(int x) {
+    x = abs(x);
+    if (x == 0) return 6.0;
+    if (x == 1) return 4.0;
+    return 1.0;
 }
 
 void main() {
@@ -61,13 +79,15 @@ void main() {
     vec3 n0 = decodeNormal(imageLoad(inNormal, pix).rgb);
     float d0 = imageLoad(inDepth, pix).r;
 
-    // Miss/background safeguard
-    bool invalidDepth0 = !(d0 > 0.0 && d0 < 1e29);
+    bool invalidDepth0 = !validDepth(d0);
+
+    vec3 a0Safe = safeAlbedo(a0);
+    vec3 base0 = c0 / a0Safe;
+    float base0Lum = luminance(base0);
 
     vec3 accum = vec3(0.0);
     float wsum = 0.0;
 
-    // 5x5 bilateral kernel
     for (int j = -2; j <= 2; ++j) {
         for (int i = -2; i <= 2; ++i) {
             ivec2 q = pix + ivec2(i, j) * stepRadius;
@@ -79,39 +99,44 @@ void main() {
             vec3 n = decodeNormal(imageLoad(inNormal, q).rgb);
             float d = imageLoad(inDepth, q).r;
 
-            float w = spatialWeight(ivec2(i, j), stepRadius);
-
-            // Color-domain stabilization
-            float colorDiff = abs(luminance(c) - luminance(c0));
-            float colorW = safeExp(-colorDiff / max(params.sigma.x, 1e-6));
-
-            // Albedo guide
-            float albedoDiff = length(a - a0);
-            float albedoW = safeExp(-albedoDiff / max(params.sigma.w, 1e-6));
-
-            // Normal guide
-            float nd = saturate(dot(n0, n));
-            float normalDiff = 1.0 - nd;
-            float normalW = safeExp(-normalDiff / max(params.sigma.y, 1e-6));
-
-            // Depth guide
-            float depthW = 1.0;
-            bool invalidDepth = !(d > 0.0 && d < 1e29);
-
-            if (invalidDepth0 != invalidDepth) {
-                depthW = 0.0;
-            } else if (!invalidDepth0) {
-                float relDepth = abs(d - d0) / max(max(abs(d0), abs(d)), 1e-4);
-                depthW = safeExp(-relDepth / max(params.sigma.z, 1e-6));
+            bool invalidDepth = !validDepth(d);
+            if (invalidDepth != invalidDepth0) {
+                continue;
             }
 
-            w *= colorW * albedoW * normalW * depthW;
+            float w = kernelWeight1D(i) * kernelWeight1D(j);
 
-            accum += c * w;
+            // Normal edge stopping
+            float nd = saturate(dot(n0, n));
+            float normalDiff = 1.0 - nd;
+            float normalW = gaussian1(normalDiff, max(params.sigma.y, 1e-4));
+
+            // Relative depth edge stopping
+            float depthW = 1.0;
+            if (!invalidDepth0) {
+                float relDepth = abs(d - d0) / max(max(abs(d0), abs(d)), 1e-4);
+                depthW = gaussian1(relDepth, max(params.sigma.z, 1e-5));
+            }
+
+            // Demodulated neighbor
+            vec3 aSafe = safeAlbedo(a);
+            vec3 base = c / aSafe;
+
+            float baseLum = luminance(base);
+            float lumDiff = abs(baseLum - base0Lum);
+            float lumW = gaussian1(lumDiff, max(params.sigma.x, 1e-4));
+
+            w *= normalW * depthW * lumW;
+
+            accum += base * w;
             wsum += w;
         }
     }
 
-    vec3 outC = (wsum > 1e-8) ? (accum / wsum) : c0;
+    vec3 filteredBase = (wsum > 1e-8) ? (accum / wsum) : base0;
+
+    // Re-modulate by center albedo
+    vec3 outC = filteredBase * a0Safe;
+
     imageStore(outColor, pix, vec4(outC, 1.0));
 }

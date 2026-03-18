@@ -7,16 +7,16 @@
       "RelativeMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|solutionrelative:src\\main.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
     },
     {
-      "AbsoluteMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\caustic_photons.comp||{8B382828-6202-11D1-8870-0000F87579D2}",
-      "RelativeMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|solutionrelative:Shared\\caustic_photons.comp||{8B382828-6202-11D1-8870-0000F87579D2}"
+      "AbsoluteMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\caustic_splat.comp||{8B382828-6202-11D1-8870-0000F87579D2}",
+      "RelativeMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|solutionrelative:Shared\\caustic_splat.comp||{8B382828-6202-11D1-8870-0000F87579D2}"
     },
     {
       "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\wavefront_rt.comp||{8B382828-6202-11D1-8870-0000F87579D2}",
       "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:Shared\\wavefront_rt.comp||{8B382828-6202-11D1-8870-0000F87579D2}"
     },
     {
-      "AbsoluteMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\denoise.comp||{8B382828-6202-11D1-8870-0000F87579D2}",
-      "RelativeMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|solutionrelative:Shared\\denoise.comp||{8B382828-6202-11D1-8870-0000F87579D2}"
+      "AbsoluteMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\caustic_photons.comp||{8B382828-6202-11D1-8870-0000F87579D2}",
+      "RelativeMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|solutionrelative:Shared\\caustic_photons.comp||{8B382828-6202-11D1-8870-0000F87579D2}"
     },
     {
       "AbsoluteMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\bvh.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
@@ -31,12 +31,8 @@
       "RelativeMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|solutionrelative:src\\obj_loader.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
     },
     {
-      "AbsoluteMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\rt_accel.h||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
-      "RelativeMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|solutionrelative:src\\rt_accel.h||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
-    },
-    {
-      "AbsoluteMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\obj_loader.h||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
-      "RelativeMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|solutionrelative:src\\obj_loader.h||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
+      "AbsoluteMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\denoise.comp||{8B382828-6202-11D1-8870-0000F87579D2}",
+      "RelativeMoniker": "D:0:0:{D3E9B99B-0AEA-42B6-BE3B-DD5D25FA249B}|Spectral Pathtracing.vcxproj|solutionrelative:Shared\\denoise.comp||{8B382828-6202-11D1-8870-0000F87579D2}"
     }
   ],
   "DocumentGroupContainers": [
@@ -46,7 +42,7 @@
       "DocumentGroups": [
         {
           "DockedWidth": 200,
-          "SelectedChildIndex": 9,
+          "SelectedChildIndex": 8,
           "Children": [
             {
               "$type": "Bookmark",
@@ -55,27 +51,14 @@
             {
               "$type": "Document",
               "DocumentIndex": 1,
-              "Title": "caustic_photons.comp",
-              "DocumentMoniker": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\caustic_photons.comp",
-              "RelativeDocumentMoniker": "Shared\\caustic_photons.comp",
-              "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\caustic_photons.comp",
-              "RelativeToolTip": "Shared\\caustic_photons.comp",
-              "ViewState": "AgIAAJ8BAAAAAAAAAAAhwLEBAAAAAAAAAAAAAA==",
+              "Title": "caustic_splat.comp",
+              "DocumentMoniker": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\caustic_splat.comp",
+              "RelativeDocumentMoniker": "Shared\\caustic_splat.comp",
+              "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\caustic_splat.comp",
+              "RelativeToolTip": "Shared\\caustic_splat.comp",
+              "ViewState": "AgIAAHMAAAAAAAAAAAAuwIwAAAAGAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
-              "WhenOpened": "2026-03-16T21:59:23.634Z",
-              "EditorCaption": ""
-            },
-            {
-              "$type": "Document",
-              "DocumentIndex": 3,
-              "Title": "denoise.comp",
-              "DocumentMoniker": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\denoise.comp",
-              "RelativeDocumentMoniker": "Shared\\denoise.comp",
-              "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\denoise.comp",
-              "RelativeToolTip": "Shared\\denoise.comp",
-              "ViewState": "AgIAAAAAAAAAAAAAAAAAACUAAAAbAAAAAAAAAA==",
-              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
-              "WhenOpened": "2026-03-16T21:59:23.066Z",
+              "WhenOpened": "2026-03-18T21:53:47.891Z",
               "EditorCaption": ""
             },
             {
@@ -86,33 +69,36 @@
               "RelativeDocumentMoniker": "src\\bvh.h",
               "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\bvh.h",
               "RelativeToolTip": "src\\bvh.h",
-              "ViewState": "AgIAABMAAAAAAAAAAAAgwBEAAAAXAAAAAAAAAA==",
+              "ViewState": "AgIAACoAAAAAAAAAAAAAAEcAAAAQAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000680|",
-              "WhenOpened": "2026-03-13T03:29:54.392Z"
+              "WhenOpened": "2026-03-13T03:29:54.392Z",
+              "EditorCaption": ""
             },
             {
               "$type": "Document",
               "DocumentIndex": 7,
-              "Title": "rt_accel.h",
-              "DocumentMoniker": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\rt_accel.h",
-              "RelativeDocumentMoniker": "src\\rt_accel.h",
-              "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\rt_accel.h",
-              "RelativeToolTip": "src\\rt_accel.h",
-              "ViewState": "AgIAABsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
-              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000680|",
-              "WhenOpened": "2026-03-13T03:29:35.341Z"
+              "Title": "denoise.comp",
+              "DocumentMoniker": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\denoise.comp",
+              "RelativeDocumentMoniker": "Shared\\denoise.comp",
+              "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\denoise.comp",
+              "RelativeToolTip": "Shared\\denoise.comp",
+              "ViewState": "AgIAACcAAAAAAAAAAAAAAEYAAAAYAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
+              "WhenOpened": "2026-03-16T21:59:23.066Z",
+              "EditorCaption": ""
             },
             {
               "$type": "Document",
-              "DocumentIndex": 8,
-              "Title": "obj_loader.h",
-              "DocumentMoniker": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\obj_loader.h",
-              "RelativeDocumentMoniker": "src\\obj_loader.h",
-              "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\obj_loader.h",
-              "RelativeToolTip": "src\\obj_loader.h",
-              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
-              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000680|",
-              "WhenOpened": "2026-03-13T03:29:30.87Z"
+              "DocumentIndex": 3,
+              "Title": "caustic_photons.comp",
+              "DocumentMoniker": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\caustic_photons.comp",
+              "RelativeDocumentMoniker": "Shared\\caustic_photons.comp",
+              "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\caustic_photons.comp",
+              "RelativeToolTip": "Shared\\caustic_photons.comp",
+              "ViewState": "AgIAANIBAAAAAAAAAAAqwAcCAAABAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
+              "WhenOpened": "2026-03-16T21:59:23.634Z",
+              "EditorCaption": ""
             },
             {
               "$type": "Document",
@@ -122,9 +108,10 @@
               "RelativeDocumentMoniker": "src\\obj_loader.cpp",
               "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\obj_loader.cpp",
               "RelativeToolTip": "src\\obj_loader.cpp",
-              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAsAAAA4AAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
-              "WhenOpened": "2026-03-13T03:29:28.282Z"
+              "WhenOpened": "2026-03-13T03:29:28.282Z",
+              "EditorCaption": ""
             },
             {
               "$type": "Document",
@@ -134,7 +121,7 @@
               "RelativeDocumentMoniker": "Shared\\wavefront_rt.comp",
               "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\Shared\\wavefront_rt.comp",
               "RelativeToolTip": "Shared\\wavefront_rt.comp",
-              "ViewState": "AgIAAG0GAAAAAAAAAAAAAJgGAAABAAAAAAAAAA==",
+              "ViewState": "AgIAADoMAAAAAAAAAAAuwFsMAAAAAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
               "WhenOpened": "2026-03-13T03:20:50.502Z",
               "EditorCaption": ""
@@ -147,7 +134,7 @@
               "RelativeDocumentMoniker": "src\\bvh.cpp",
               "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\bvh.cpp",
               "RelativeToolTip": "src\\bvh.cpp",
-              "ViewState": "AgIAACkAAAAAAAAAAAAQwD4AAAAoAAAAAAAAAA==",
+              "ViewState": "AgIAAMAAAAAAAAAAAAAkwN8AAAAVAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
               "WhenOpened": "2026-03-12T17:48:22.534Z",
               "EditorCaption": ""
@@ -160,7 +147,7 @@
               "RelativeDocumentMoniker": "src\\main.cpp",
               "ToolTip": "C:\\Users\\tromn\\source\\repos\\Spectral Pathtracing\\src\\main.cpp",
               "RelativeToolTip": "src\\main.cpp",
-              "ViewState": "AgIAALYJAAAAAAAAAAAQwMsJAAA4AAAAAAAAAA==",
+              "ViewState": "AgIAAGcBAAAAAAAAAAArwIQBAAAOAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
               "WhenOpened": "2026-03-12T14:04:27.965Z",
               "EditorCaption": ""

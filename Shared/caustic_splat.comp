@@ -1,0 +1,240 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+const float PI = 3.14159265358979323846;
+const float EPS = 1e-8;
+const float LAMBDA_MIN = 400.0;
+const float LAMBDA_MAX = 700.0;
+const float XYZ_NORMALIZE = 0.00936;
+
+struct CausticPhotonHit {
+    vec4 pos_power;   // xyz = world hit pos, w = scalar flux/power
+    vec4 wi_lambda;   // xyz = incoming dir at receiver, w = wavelength nm
+    vec4 axis0_len;   // xyz = footprint axis0 in world space, w = length
+    vec4 axis1_len;   // xyz = footprint axis1 in world space, w = length
+};
+
+layout(std140, binding = 0) uniform FrameParams {
+    uvec4 screen;    // x=width, y=height, z=pathCount, w=frameIndex
+    uvec4 extra;     // x=emissiveTriangleCount, y=sunEnabled, z=fogEnabled, w=maxBounces
+
+    vec4 camPos;
+    vec4 camForward;
+    vec4 camRight;
+    vec4 camUp;
+    vec4 camData;    // x = tanHalfFovY, y = aspect
+
+    vec4 sunDirIntensity;
+    vec4 sunColor;
+    vec4 fogParams;
+
+    vec4 misc;       // x=causticStrength, y=gatherRadius, z=wavelengthBandwidth, w=unused
+    vec4 misc2;      // x=causticBounces, y,z unused, w=sceneExtent
+    uvec4 causticState; // x=photonsPerFrame, y=frameCounter, z=accumulatedPhotonCount, w=unused
+
+    uvec4 transmissiveTriangleCount;
+
+    vec4 whiteBalance;
+
+    uint photonHitCapacity;
+    uint photonPad0;
+    uint photonPad1;
+    uint photonPad2;
+} frame;
+
+layout(std430, binding = 1) readonly buffer PhotonHitCounterBuffer {
+    uint photonHitCount;
+};
+
+layout(std430, binding = 2) readonly buffer PhotonHitBuffer {
+    CausticPhotonHit photonHits[];
+};
+
+layout(binding = 3, rgba32f) uniform coherent image2D causticsImage;
+
+float gauss1(float x, float mu, float sigma) {
+    float t = (x - mu) / sigma;
+    return exp(-0.5 * t * t);
+}
+
+vec3 cie_xyz_bar(float lambda) {
+    float x =
+        1.056 * gauss1(lambda, 599.8, 37.9) +
+        0.362 * gauss1(lambda, 442.0, 16.0) -
+        0.065 * gauss1(lambda, 501.1, 20.4);
+
+    float y =
+        0.821 * gauss1(lambda, 568.8, 23.4) +
+        0.286 * gauss1(lambda, 530.9, 32.3);
+
+    float z =
+        1.217 * gauss1(lambda, 437.0, 11.8) +
+        0.681 * gauss1(lambda, 459.0, 26.0);
+
+    return max(vec3(x, y, z), vec3(0.0)) * XYZ_NORMALIZE;
+}
+
+vec2 worldToPixel(vec3 p, out bool ok, out float viewZ) {
+    vec3 d = p - frame.camPos.xyz;
+
+    float xCam = dot(d, frame.camRight.xyz);
+    float yCam = dot(d, frame.camUp.xyz);
+    float zCam = dot(d, frame.camForward.xyz);
+
+    viewZ = zCam;
+    ok = (zCam > 1e-5);
+    if (!ok) {
+        return vec2(0.0);
+    }
+
+    float tanHalfFovY = frame.camData.x;
+    float aspect = frame.camData.y;
+
+    float xNdc = xCam / (zCam * tanHalfFovY * aspect);
+    float yNdc = yCam / (zCam * tanHalfFovY);
+
+    float px = (xNdc * 0.5 + 0.5) * float(frame.screen.x);
+    float py = (-yNdc * 0.5 + 0.5) * float(frame.screen.y);
+
+    return vec2(px, py);
+}
+
+mat2 inverse2(mat2 m) {
+    float det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+    if (abs(det) < 1e-10) {
+        return mat2(0.0);
+    }
+    float invDet = 1.0 / det;
+    return mat2(
+         m[1][1], -m[0][1],
+        -m[1][0],  m[0][0]
+    ) * invDet;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint count = min(photonHitCount, frame.photonHitCapacity);
+    if (idx >= count) {
+        return;
+    }
+
+    CausticPhotonHit ph = photonHits[idx];
+
+    vec3 worldPos = ph.pos_power.xyz;
+    float flux = ph.pos_power.w;
+    float lambda = ph.wi_lambda.w;
+
+    if (flux <= 0.0) {
+        return;
+    }
+
+    bool okC;
+    float zc;
+    vec2 centerPx = worldToPixel(worldPos, okC, zc);
+    if (!okC) {
+        return;
+    }
+
+    vec3 axis0World = ph.axis0_len.xyz;
+    vec3 axis1World = ph.axis1_len.xyz;
+
+    // Fallback if the footprint vectors are degenerate.
+    if (dot(axis0World, axis0World) < 1e-16 || dot(axis1World, axis1World) < 1e-16) {
+        return;
+    }
+
+    bool ok0p, ok0m, ok1p, ok1m;
+    float tmpz;
+
+    vec2 p0p = worldToPixel(worldPos + axis0World, ok0p, tmpz);
+    vec2 p0m = worldToPixel(worldPos - axis0World, ok0m, tmpz);
+    vec2 p1p = worldToPixel(worldPos + axis1World, ok1p, tmpz);
+    vec2 p1m = worldToPixel(worldPos - axis1World, ok1m, tmpz);
+
+    if (!(ok0p && ok0m && ok1p && ok1m)) {
+        return;
+    }
+
+    // Screen-space ellipse axes from projected world-space footprint directions.
+    vec2 a = 0.5 * (p0p - p0m);
+    vec2 b = 0.5 * (p1p - p1m);
+
+    float lenA = length(a);
+    float lenB = length(b);
+    if (lenA < 0.25 && lenB < 0.25) {
+        // Tiny footprint: splat one pixel.
+        ivec2 ip = ivec2(floor(centerPx));
+        if (ip.x < 0 || ip.y < 0 || ip.x >= int(frame.screen.x) || ip.y >= int(frame.screen.y)) {
+            return;
+        }
+
+        vec3 xyz = cie_xyz_bar(lambda) * flux;
+        vec4 oldV = imageLoad(causticsImage, ip);
+        imageStore(causticsImage, ip, oldV + vec4(xyz, 0.0));
+        return;
+    }
+
+    // Conservative bounding radius in pixels.
+    float radiusPx = max(lenA, lenB);
+    radiusPx = max(radiusPx, 1.0);
+
+    // clamp to avoid laggy near camera splats
+    const float MAX_SPLAT_RADIUS_PX = 32.0;
+    if (radiusPx > MAX_SPLAT_RADIUS_PX) {
+        float s = MAX_SPLAT_RADIUS_PX / radiusPx;
+        a *= s;
+        b *= s;
+        radiusPx = MAX_SPLAT_RADIUS_PX;
+    }
+
+    int minX = int(floor(centerPx.x - radiusPx - 1.0));
+    int maxX = int(ceil (centerPx.x + radiusPx + 1.0));
+    int minY = int(floor(centerPx.y - radiusPx - 1.0));
+    int maxY = int(ceil (centerPx.y + radiusPx + 1.0));
+
+    minX = clamp(minX, 0, int(frame.screen.x) - 1);
+    maxX = clamp(maxX, 0, int(frame.screen.x) - 1);
+    minY = clamp(minY, 0, int(frame.screen.y) - 1);
+    maxY = clamp(maxY, 0, int(frame.screen.y) - 1);
+
+    // Ellipse parameterization:
+    // p = center + a*u + b*v, with u^2 + v^2 <= 1
+    mat2 M = mat2(a, b);
+    mat2 invM = inverse2(M);
+
+    float detM = abs(determinant(M));
+    if (detM < 1e-8) {
+        return;
+    }
+
+    // Convert scalar spectral flux into XYZ once.
+    vec3 photonXYZ = cie_xyz_bar(lambda) * flux;
+
+    // Normalize kernel so the total deposited energy is roughly conserved.
+    // Using Gaussian-like weight over ellipse domain.
+    float weightNorm = 1.0 / max(0.55774628535 * PI * detM, 1e-8);
+    // 0.5577... is approximate integral of exp(-2 r^2) over unit disk divided by area scaling.
+
+    for (int y = minY; y <= maxY; ++y) {
+        for (int x = minX; x <= maxX; ++x) {
+            vec2 p = vec2(float(x) + 0.5, float(y) + 0.5);
+            vec2 local = invM * (p - centerPx);
+
+            float r2 = dot(local, local);
+            if (r2 > 1.0) {
+                continue;
+            }
+
+            // Smooth elliptical kernel.
+            float w = exp(-2.0 * r2);
+
+            vec3 contrib = photonXYZ * (w * weightNorm);
+
+            ivec2 ip = ivec2(x, y);
+            vec4 oldV = imageLoad(causticsImage, ip);
+            imageStore(causticsImage, ip, oldV + vec4(contrib, 0.0));
+        }
+    }
+}

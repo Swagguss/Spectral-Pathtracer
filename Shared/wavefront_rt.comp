@@ -10,6 +10,15 @@ const float EPS = 1e-4;
 const float INF_T = 1e30;
 const float MEDIUM_EPS = 1e-4;
 
+const float MNEE_EPS_UV = 2e-3;
+const float MNEE_EPS_C  = 5e-4;
+const float MNEE_SPEC_SMOOTH = 0.985;
+const float EPS_RAY = 5e-5;
+
+const float MNEE_MAX_INITIAL_ERR_2 = 0.15;
+const float MNEE_MAX_INITIAL_ERR_1 = 0.10;
+const float MNEE_MAX_INITIAL_ERR_3 = 0.20;
+
 const float GLASS_MIN_TRANSMIT = 0.02;
 const float GLASS_ABSORB_SCALE = 2.0;
 const float MIN_T = 1e-3;
@@ -20,6 +29,19 @@ const uint EVT_REFLECT = 1u;
 const float LAMBDA_MIN = 400.0;
 const float LAMBDA_MAX = 700.0;
 const float XYZ_NORMALIZE = 0.00936;
+
+struct MneeSeed {
+    uint count;
+    uint tri[3];
+    vec2 uv[3];
+    uint evt[3];
+};
+
+struct MneeSolve {
+    bool ok;
+    float invAbsDetJ;
+    MneeSeed seed;
+};
 
 struct GpuPathState {
     vec4 ro;
@@ -61,21 +83,14 @@ struct TriVerts {
     vec3 p2;
 };
 
-struct SphericalTriSample {
-    float b0;
-    float b1;
-    float b2;
-    float pdfW;
-};
-
-struct LightPointSample {
-    vec3 p;
-    float pdfW;
-};
-
 struct EmissiveTriangle {
     uvec4 triIndex_pad;         // x = triIndex
     vec4 area_pmf_cdf_pad;      // x = area, y = pmf, z = cdf
+};
+
+struct TransmissiveTriangle {
+    uvec4 triIndex_pad;
+    vec4 area_pmf_cdf_pad; // x=area, y=weight/pdf-mass, z=cdf
 };
 
 struct CausticPhoton {
@@ -85,8 +100,8 @@ struct CausticPhoton {
 };
 
 layout(std140, binding = 0) uniform FrameParams {
-    uvec4 screen;   // x = width, y = height, z = pathCount, w = frameIndex
-    uvec4 extra;    // x = emissiveTriangleCount, y = sunEnabled, z = fogEnabled, w = maxBounces
+    uvec4 screen;
+    uvec4 extra;
 
     vec4 camPos;
     vec4 camForward;
@@ -94,17 +109,22 @@ layout(std140, binding = 0) uniform FrameParams {
     vec4 camUp;
     vec4 camData;
 
-    vec4 sunDirIntensity; // xyz = dir, w = intensity
-    vec4 sunColor;        // xyz = color
-    vec4 fogParams;       // x = density, y = g
+    vec4 sunDirIntensity;
+    vec4 sunColor;
+    vec4 fogParams;
 
-    vec4 misc; // x = caustic strength, y = caustic gather radius, z = wavelength bandwidth in nm, w = max stored photons
+    vec4 misc;
+    vec4 misc2;
+    uvec4 causticState;
+
+    uvec4 transmissiveTriangleCount;
 
     vec4 whiteBalance;
 
-    vec4 gridMin;
-    vec4 gridMax;
-    uvec4 gridRes; // x=W, y=H, z=D, w=maxPhotonsPerCell
+    uint photonHitCapacity;
+    uint photonPad0;
+    uint photonPad1;
+    uint photonPad2;
 } frame;
 
 layout(std430, binding = 1) buffer PathBuffer {
@@ -144,53 +164,46 @@ layout(binding = 11, rgba32f) uniform writeonly image2D albedoImage;
 layout(binding = 12, rgba32f) uniform writeonly image2D normalImage;
 layout(binding = 13, rgba32f) uniform writeonly image2D depthImage;
 
-layout(std430, binding = 14) buffer PhotonGridCountBuffer {
-    uint photonGridCounts[];
+//layout(std430, binding = 14) buffer PhotonGridCountBuffer {
+//    uint photonGridCounts[];
+//};
+//
+//layout(std430, binding = 15) buffer PhotonGridPhotonBuffer {
+//    CausticPhoton photonGridPhotons[];
+//};
+//
+layout(std430, binding = 16) readonly buffer TransmissiveTriBuffer {
+    TransmissiveTriangle transmissiveTriangles[];
 };
 
-layout(std430, binding = 15) buffer PhotonGridPhotonBuffer {
-    CausticPhoton photonGridPhotons[];
-};
+layout(binding = 17, rgba32f) uniform readonly image2D causticsImage;
 
-uvec3 photonGridRes3() {
-    return uvec3(frame.gridRes.x, frame.gridRes.y, frame.gridRes.z);
+vec3 sampleCausticsImageXYZ(ivec2 pix) {
+    return max(imageLoad(causticsImage, pix).xyz, vec3(0.0));
 }
 
-uint photonGridMaxPerCell() {
-    return frame.gridRes.w;
-}
+uint sampleTransmissiveTriangle(float xi, uint count) {
+    if (count == 0u) {
+        return 0u;
+    }
 
-vec3 photonGridMin3() {
-    return frame.gridMin.xyz;
-}
+    xi = min(max(xi, 0.0), 0.99999994);
 
-vec3 photonGridMax3() {
-    return frame.gridMax.xyz;
-}
+    uint lo = 0u;
+    uint hi = count;
 
-vec3 photonGridCellSize() {
-    vec3 ext = photonGridMax3() - photonGridMin3();
-    return ext / max(vec3(photonGridRes3()), vec3(1.0));
-}
+    while (lo < hi) {
+        uint mid = lo + ((hi - lo) >> 1u);
+        float cdf = transmissiveTriangles[mid].area_pmf_cdf_pad.z;
 
-bool pointInsidePhotonGrid(vec3 p) {
-    return all(greaterThanEqual(p, photonGridMin3())) &&
-           all(lessThanEqual(p, photonGridMax3()));
-}
+        if (xi <= cdf) {
+            hi = mid;
+        } else {
+            lo = mid + 1u;
+        }
+    }
 
-uvec3 pointToPhotonGridCell(vec3 p) {
-    vec3 rel = (p - photonGridMin3()) / max(photonGridCellSize(), vec3(1e-8));
-    vec3 clamped = clamp(rel, vec3(0.0), vec3(photonGridRes3()) - vec3(1e-4));
-    return uvec3(clamped);
-}
-
-uint flattenPhotonGridCell(uvec3 c) {
-    uvec3 r = photonGridRes3();
-    return c.x + r.x * (c.y + r.y * c.z);
-}
-
-uint photonGridLinearIndex(uint cellIndex, uint slot) {
-    return cellIndex * photonGridMaxPerCell() + slot;
+    return min(lo, count - 1u);
 }
 
 vec3 loadNormal(uint vertexIndex) {
@@ -229,14 +242,10 @@ float gauss1(float x, float mu, float sigma) {
     return exp(-0.5 * t * t);
 }
 
-float triangleArea(vec3 a, vec3 b, vec3 c) {
-    return 0.5 * length(cross(b - a, c - a));
-}
-
 float rgb_to_spectrum_unit(float lambda, vec3 rgb) {
-    float Sr = exp(-((lambda - 610.0) / 60.0) * ((lambda - 610.0) / 60.0));
-    float Sg = exp(-((lambda - 540.0) / 60.0) * ((lambda - 540.0) / 60.0));
-    float Sb = exp(-((lambda - 460.0) / 30.0) * ((lambda - 460.0) / 30.0));
+    float Sr = exp(-((lambda - 610.0) / 35.0) * ((lambda - 610.0) / 35.0));
+    float Sg = exp(-((lambda - 540.0) / 30.0) * ((lambda - 540.0) / 30.0));
+    float Sb = exp(-((lambda - 460.0) / 20.0) * ((lambda - 460.0) / 20.0));
 
     float denom = max(Sr + Sg + Sb, 1e-6);
     vec3 c = max(rgb, vec3(0.0));
@@ -287,76 +296,84 @@ vec3 xyz_to_linear_srgb(vec3 xyz) {
     return vec3(r, g, b);
 }
 
-float gatherCausticPhotons(
-    vec3 hitPos,
-    vec3 Ns,
-    float lambda,
-    float albedoS
-) {
-    if (!pointInsidePhotonGrid(hitPos)) {
-        return 0.0;
-    }
-
-    float gatherR = frame.misc.y;
-    float gatherR2 = gatherR * gatherR;
-    float lambdaSigma = max(frame.misc.z, 1e-4);
-
-    vec3 cellSize = photonGridCellSize();
-    ivec3 reach = ivec3(ceil(vec3(gatherR) / max(cellSize, vec3(1e-8))));
-    ivec3 baseCell = ivec3(pointToPhotonGridCell(hitPos));
-    ivec3 gridRes = ivec3(photonGridRes3());
-
-    float sumFlux = 0.0;
-
-    for (int dz = -reach.z; dz <= reach.z; ++dz) {
-        for (int dy = -reach.y; dy <= reach.y; ++dy) {
-            for (int dx = -reach.x; dx <= reach.x; ++dx) {
-                ivec3 cc = baseCell + ivec3(dx, dy, dz);
-                if (any(lessThan(cc, ivec3(0))) || any(greaterThanEqual(cc, gridRes))) {
-                    continue;
-                }
-
-                uint cellIndex = flattenPhotonGridCell(uvec3(cc));
-                uint stored = min(photonGridCounts[cellIndex], photonGridMaxPerCell());
-
-                for (uint s = 0u; s < stored; ++s) {
-                    uint idx = photonGridLinearIndex(cellIndex, s);
-                    CausticPhoton ph = photonGridPhotons[idx];
-
-                    vec3 d = ph.pos_radius.xyz - hitPos;
-                    float r2 = dot(d, d);
-                    if (r2 > gatherR2) {
-                        continue;
-                    }
-
-                    vec3 wi = -normalize(ph.wi_lambda.xyz);
-                    if (dot(Ns, wi) <= 0.0) {
-                        continue;
-                    }
-
-                    float dLambda = ph.wi_lambda.w - lambda;
-                    float spectralW = exp(-0.5 * (dLambda * dLambda) / (lambdaSigma * lambdaSigma));
-
-                    float spatialW = max(0.0, 1.0 - r2 / gatherR2); // cone kernel
-
-                    sumFlux += ph.power_pad.x * spectralW * spatialW;
-                }
-            }
-        }
-    }
-
-    float area = PI * gatherR * gatherR;
-    float irradiance = sumFlux / max(area, 1e-8);
-
-    // diffuse receiver estimate
-    float fr = albedoS / PI;
-    return irradiance * fr;
+vec3 linear_srgb_to_xyz(vec3 rgb) {
+    float x = 0.4124 * rgb.r + 0.3576 * rgb.g + 0.1805 * rgb.b;
+    float y = 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
+    float z = 0.0193 * rgb.r + 0.1192 * rgb.g + 0.9505 * rgb.b;
+    return vec3(x, y, z);
 }
 
 vec3 orthonormalT(vec3 N) {
     return normalize(abs(N.z) < 0.999
         ? cross(N, vec3(0.0, 0.0, 1.0))
         : cross(N, vec3(0.0, 1.0, 0.0)));
+}
+
+bool pointToTriangleBary(
+    vec3 p, vec3 a, vec3 b, vec3 c,
+    out vec3 bc
+) {
+    vec3 v0 = b - a;
+    vec3 v1 = c - a;
+    vec3 v2 = p - a;
+
+    float d00 = dot(v0, v0);
+    float d01 = dot(v0, v1);
+    float d11 = dot(v1, v1);
+    float d20 = dot(v2, v0);
+    float d21 = dot(v2, v1);
+
+    float denom = d00 * d11 - d01 * d01;
+    if (abs(denom) < 1e-12) {
+        bc = vec3(1.0, 0.0, 0.0);
+        return false;
+    }
+
+    float v = (d11 * d20 - d01 * d21) / denom;
+    float w = (d00 * d21 - d01 * d20) / denom;
+    float u = 1.0 - v - w;
+
+    bc = vec3(u, v, w);
+    return true;
+}
+
+vec3 baryToPoint(vec3 bc, vec3 a, vec3 b, vec3 c) {
+    return bc.x * a + bc.y * b + bc.z * c;
+}
+
+float randn(inout uint rng) {
+    float u1 = max(rand01(rng), 1e-8);
+    float u2 = rand01(rng);
+    return sqrt(-2.0 * log(u1)) * cos(2.0 * PI * u2);
+}
+
+bool sampleTriangleGuidedBary(
+    vec3 bcCenter,
+    float sigma,
+    inout uint rng,
+    out vec3 bc,
+    out float pdfLocal
+) {
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        float dv = randn(rng) * sigma;
+        float dw = randn(rng) * sigma;
+
+        float v = bcCenter.y + dv;
+        float w = bcCenter.z + dw;
+        float u = 1.0 - v - w;
+
+        if (u >= 0.0 && v >= 0.0 && w >= 0.0) {
+            bc = vec3(u, v, w);
+
+            float g = exp(-0.5 * (dv * dv + dw * dw) / max(sigma * sigma, 1e-8));
+            pdfLocal = g / max(2.0 * PI * sigma * sigma, 1e-8);
+            return true;
+        }
+    }
+
+    bc = bcCenter;
+    pdfLocal = 1.0 / max(2.0 * PI * sigma * sigma, 1e-8);
+    return all(greaterThanEqual(bcCenter, vec3(0.0)));
 }
 
 void makeBasis(vec3 N, out vec3 T, out vec3 B) {
@@ -449,6 +466,11 @@ float iorAtLambda(float iorD, float dispersionStrength, float lambdaNm) {
     return A + B / (lambda * lambda);
 }
 
+float materialIorAtLambda(uint triIndex, float lambda) {
+    Material mat = materials[triangleMaterialIndices[triIndex]];
+    return iorAtLambda(mat.metallic_smoothShading_transmission_ior.w, mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x, lambda);
+}
+
 vec3 loadVertex(uint vertexIndex) {
     uint base = vertexIndex * 3u;
     return vec3(
@@ -465,16 +487,6 @@ void loadTriangle(uint triIndex, out vec3 v0, out vec3 v1, out vec3 v2) {
     v0 = loadVertex(i0);
     v1 = loadVertex(i1);
     v2 = loadVertex(i2);
-}
-
-TriVerts loadTriVerts(uint triIndex) {
-    vec3 v0, v1, v2;
-    loadTriangle(triIndex, v0, v1, v2);
-    TriVerts tv;
-    tv.p0 = v0;
-    tv.p1 = v1;
-    tv.p2 = v2;
-    return tv;
 }
 
 vec3 triangleNormal(vec3 v0, vec3 v1, vec3 v2) {
@@ -591,13 +603,6 @@ bool isOpaqueDeltaSpecular(float transmission, float metallic, float smoothness)
     return transmission <= 0.001 && metallic > 0.999 && smoothness > 0.98;
 }
 
-vec3 fresnelSchlick(float cosTheta, vec3 F0) {
-    float m = 1.0 - saturate(cosTheta);
-    float m2 = m * m;
-    float m5 = m2 * m2 * m;
-    return F0 + (1.0 - F0) * m5;
-}
-
 float fresnelSchlickScalar(float cosTheta, float F0) {
     float m = 1.0 - saturate(cosTheta);
     float m2 = m * m;
@@ -633,18 +638,6 @@ vec3 sampleCosineHemisphere(vec3 N, vec2 u) {
     vec3 B = cross(T, N);
 
     return normalize(T * x + B * y + N * z);
-}
-
-vec3 toLocal(vec3 N, vec3 v) {
-    vec3 T, B;
-    makeBasis(N, T, B);
-    return vec3(dot(v, T), dot(v, B), dot(v, N));
-}
-
-vec3 toWorld(vec3 N, vec3 vLocal) {
-    vec3 T, B;
-    makeBasis(N, T, B);
-    return normalize(T * vLocal.x + B * vLocal.y + N * vLocal.z);
 }
 
 float mediumSunDirect(
@@ -1251,6 +1244,1723 @@ float evalBSDFScalar(
     return diff + spec;
 }
 
+bool traceClosestMaxT(
+    vec3 ro,
+    vec3 rd,
+    float tMax,
+    out uint outPrim,
+    out float outTHit,
+    out vec2 outBary
+) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq,
+        sceneTLAS,
+        gl_RayFlagsOpaqueEXT,
+        0xFF,
+        ro,
+        EPS,
+        rd,
+        tMax
+    );
+
+    while (rayQueryProceedEXT(rq)) {}
+
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        return false;
+    }
+
+    outPrim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+    outTHit = rayQueryGetIntersectionTEXT(rq, true);
+    outBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+    return true;
+}
+
+bool pointInTriBary(vec2 uv) {
+    float u = uv.x;
+    float v = uv.y;
+    float w = 1.0 - u - v;
+    return u >= 0.0 && v >= 0.0 && w >= 0.0;
+}
+
+vec3 triPoint(uint prim, vec2 uv) {
+    vec3 v0, v1, v2;
+    loadTriangle(prim, v0, v1, v2);
+    float u = uv.x;
+    float v = uv.y;
+    float w = 1.0 - u - v;
+    return v0 * w + v1 * u + v2 * v;
+}
+
+vec3 triNormalFlat(uint prim) {
+    vec3 v0, v1, v2;
+    loadTriangle(prim, v0, v1, v2);
+    return triangleNormal(v0, v1, v2);
+}
+
+vec3 triPointUnclamped(uint prim, vec2 uv) {
+    vec3 v0, v1, v2;
+    loadTriangle(prim, v0, v1, v2);
+    float u = uv.x;
+    float v = uv.y;
+    float w = 1.0 - u - v;
+    return v0 * w + v1 * u + v2 * v;
+}
+
+uint quadAlternateIfSameMat(uint triId) {
+    uint alt = triId ^ 1u;
+    if (triangleMaterialIndices[alt] == triangleMaterialIndices[triId]) {
+        return alt;
+    }
+    return triId;
+}
+
+float triAreaJacobianUv(uint triId) {
+    vec3 a, b, c;
+    loadTriangle(triId, a, b, c);
+    return length(cross(b - a, c - a));
+}
+
+bool isMneeSpecular(Material mat) {
+    return mat.metallic_smoothShading_transmission_ior.z > 0.0 &&
+           mat.albedo_smoothness.w >= MNEE_SPEC_SMOOTH;
+}
+
+void tangentBasisFromN(vec3 n, out vec3 T, out vec3 B) {
+    T = orthonormalT(n);
+    B = cross(n, T);
+}
+
+float maxAbsConstraint2(vec2 c) {
+    return max(abs(c.x), abs(c.y));
+}
+
+float maxAbsConstraint4(vec4 c) {
+    return max(max(abs(c.x), abs(c.y)), max(abs(c.z), abs(c.w)));
+}
+
+vec3 triShadeNormalAt(uint prim, vec2 bary, vec3 rayDir) {
+    uint i0 = indexData[prim * 3u + 0u];
+    uint i1 = indexData[prim * 3u + 1u];
+    uint i2 = indexData[prim * 3u + 2u];
+
+    float b1 = bary.x;
+    float b2 = bary.y;
+    float b0 = 1.0 - b1 - b2;
+
+    vec3 geomN = triNormalFlat(prim);
+    bool frontFace = dot(rayDir, geomN) < 0.0;
+    vec3 Ng = frontFace ? geomN : -geomN;
+
+    Material mat = materials[triangleMaterialIndices[prim]];
+    float smoothShading = mat.metallic_smoothShading_transmission_ior.y;
+
+    vec3 n0 = loadNormal(i0);
+    vec3 n1 = loadNormal(i1);
+    vec3 n2 = loadNormal(i2);
+
+    vec3 smoothN = normalize(n0 * b0 + n1 * b1 + n2 * b2);
+    vec3 rawShadeN = (smoothShading > 0.5) ? smoothN : Ng;
+
+    return normalize(dot(rawShadeN, Ng) >= 0.0 ? rawShadeN : -rawShadeN);
+}
+
+bool isDeltaTransmissivePrim(uint prim) {
+    Material mat = materials[triangleMaterialIndices[prim]];
+    return mat.metallic_smoothShading_transmission_ior.z > 0.001 &&
+           isDeltaSpecular(mat.albedo_smoothness.w);
+}
+
+float spectralAbsorptionAtPrim(uint prim, float lambda) {
+    Material mat = materials[triangleMaterialIndices[prim]];
+    float specAlb = rgb_to_reflectance_spectrum(lambda, mat.albedo_smoothness.xyz);
+    return -log(max(specAlb, 1e-3));
+}
+
+float primIorAtLambda(uint prim, float lambda) {
+    Material mat = materials[triangleMaterialIndices[prim]];
+    return iorAtLambda(
+        mat.metallic_smoothShading_transmission_ior.w,
+        mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x,
+        lambda
+    );
+}
+
+bool refractOrFail(vec3 I, vec3 N, float etaI, float etaT, out vec3 T) {
+    return refractDir(I, N, etaI / etaT, T);
+}
+
+void tangentFrameAtSpecPoint(uint prim, vec2 uv, vec3 rayDir, out vec3 T, out vec3 B, out vec3 N) {
+    N = triShadeNormalAt(prim, uv, rayDir);
+    makeBasis(N, T, B);
+}
+
+vec4 manifoldResidualTwoRefraction(
+    vec3 receiverPos,
+    vec3 lightPos,
+    uint prim1,
+    uint prim2,
+    vec2 uv1,
+    vec2 uv2,
+    float lambda
+) {
+    vec3 P1 = triPoint(prim1, uv1);
+    vec3 P2 = triPoint(prim2, uv2);
+
+    vec3 d0 = normalize(P1 - receiverPos);
+    vec3 d1 = normalize(P2 - P1);
+    vec3 d2 = normalize(lightPos - P2);
+
+    vec3 T1, B1, N1;
+    tangentFrameAtSpecPoint(prim1, uv1, d0, T1, B1, N1);
+
+    vec3 T2, B2, N2;
+    tangentFrameAtSpecPoint(prim2, uv2, d1, T2, B2, N2);
+
+    float ior1 = primIorAtLambda(prim1, lambda);
+    float ior2 = primIorAtLambda(prim2, lambda);
+
+    vec3 pred1;
+    if (!refractOrFail(d0, N1, 1.0, ior1, pred1)) {
+        return vec4(1e4);
+    }
+
+    vec3 pred2;
+    if (!refractOrFail(d1, N2, ior2, 1.0, pred2)) {
+        return vec4(1e4);
+    }
+
+    vec3 e1 = d1 - pred1;
+    vec3 e2 = d2 - pred2;
+
+    return vec4(
+        dot(T1, e1),
+        dot(B1, e1),
+        dot(T2, e2),
+        dot(B2, e2)
+    );
+}
+
+float residualNorm2(vec4 r) {
+    return dot(r, r);
+}
+
+mat4 numericalJacobianTwoRefraction(
+    vec3 receiverPos,
+    vec3 lightPos,
+    uint prim1,
+    uint prim2,
+    vec2 uv1,
+    vec2 uv2,
+    float lambda
+) {
+    vec4 r0 = manifoldResidualTwoRefraction(receiverPos, lightPos, prim1, prim2, uv1, uv2, lambda);
+
+    float h = 1e-4;
+    mat4 J = mat4(0.0);
+
+    for (int c = 0; c < 4; ++c) {
+        vec2 u1p = uv1;
+        vec2 u2p = uv2;
+
+        if (c == 0) u1p.x += h;
+        if (c == 1) u1p.y += h;
+        if (c == 2) u2p.x += h;
+        if (c == 3) u2p.y += h;
+
+        vec4 rp = manifoldResidualTwoRefraction(receiverPos, lightPos, prim1, prim2, u1p, u2p, lambda);
+        vec4 col = (rp - r0) / h;
+
+        J[c][0] = col.x;
+        J[c][1] = col.y;
+        J[c][2] = col.z;
+        J[c][3] = col.w;
+    }
+
+    return J;
+}
+
+// Solves A x = b in place. Returns false if singular.
+bool solveLinear4(in mat4 A, in vec4 b, out vec4 x) {
+    float M[4][5];
+
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            M[r][c] = A[c][r];
+        }
+    }
+    M[0][4] = b.x;
+    M[1][4] = b.y;
+    M[2][4] = b.z;
+    M[3][4] = b.w;
+
+    for (int k = 0; k < 4; ++k) {
+        int piv = k;
+        float best = abs(M[k][k]);
+        for (int r = k + 1; r < 4; ++r) {
+            float v = abs(M[r][k]);
+            if (v > best) {
+                best = v;
+                piv = r;
+            }
+        }
+
+        if (best < 1e-10) {
+            x = vec4(0.0);
+            return false;
+        }
+
+        if (piv != k) {
+            for (int c = k; c < 5; ++c) {
+                float tmp = M[k][c];
+                M[k][c] = M[piv][c];
+                M[piv][c] = tmp;
+            }
+        }
+
+        float invPivot = 1.0 / M[k][k];
+        for (int c = k; c < 5; ++c) {
+            M[k][c] *= invPivot;
+        }
+
+        for (int r = 0; r < 4; ++r) {
+            if (r == k) continue;
+            float f = M[r][k];
+            for (int c = k; c < 5; ++c) {
+                M[r][c] -= f * M[k][c];
+            }
+        }
+    }
+
+    x = vec4(M[0][4], M[1][4], M[2][4], M[3][4]);
+    return true;
+}
+
+bool newtonSolveTwoRefractionManifold(
+    vec3 receiverPos,
+    vec3 lightPos,
+    uint prim1,
+    uint prim2,
+    float lambda,
+    inout vec2 uv1,
+    inout vec2 uv2,
+    out mat4 outJ,
+    out float outDetJ
+) {
+    outJ = mat4(0.0);
+    outDetJ = 0.0;
+
+    const int MAX_ITERS = 12;
+    const float TOL = 1e-10;
+
+    for (int it = 0; it < MAX_ITERS; ++it) {
+        vec4 r = manifoldResidualTwoRefraction(receiverPos, lightPos, prim1, prim2, uv1, uv2, lambda);
+        float err2 = residualNorm2(r);
+        if (err2 < TOL) {
+            outJ = numericalJacobianTwoRefraction(receiverPos, lightPos, prim1, prim2, uv1, uv2, lambda);
+            outDetJ = determinant(outJ);
+            return abs(outDetJ) > 1e-12;
+        }
+
+        mat4 J = numericalJacobianTwoRefraction(receiverPos, lightPos, prim1, prim2, uv1, uv2, lambda);
+        vec4 step;
+        if (!solveLinear4(J, -r, step)) {
+            return false;
+        }
+
+        float alpha = 1.0;
+        bool accepted = false;
+        for (int ls = 0; ls < 8; ++ls) {
+            vec2 cand1 = uv1 + alpha * step.xy;
+            vec2 cand2 = uv2 + alpha * step.zw;
+
+            if (pointInTriBary(cand1) && pointInTriBary(cand2)) {
+                vec4 rc = manifoldResidualTwoRefraction(receiverPos, lightPos, prim1, prim2, cand1, cand2, lambda);
+                if (residualNorm2(rc) < err2) {
+                    uv1 = cand1;
+                    uv2 = cand2;
+                    accepted = true;
+                    break;
+                }
+            }
+
+            alpha *= 0.5;
+        }
+
+        if (!accepted) {
+            return false;
+        }
+    }
+
+    vec4 r = manifoldResidualTwoRefraction(receiverPos, lightPos, prim1, prim2, uv1, uv2, lambda);
+    if (residualNorm2(r) >= 1e-8) {
+        return false;
+    }
+
+    outJ = numericalJacobianTwoRefraction(receiverPos, lightPos, prim1, prim2, uv1, uv2, lambda);
+    outDetJ = determinant(outJ);
+    return abs(outDetJ) > 1e-12;
+}
+
+bool segmentHitsExpected(
+    vec3 o0,
+    vec3 p1,
+    int expectedTri
+) {
+    if (expectedTri < 0) return false;
+
+    vec3 d = p1 - o0;
+    float dist2 = dot(d, d);
+    if (dist2 <= 1e-12) return false;
+
+    float dist = sqrt(dist2);
+    vec3 dir = d / dist;
+
+    float epsSeg = EPS_RAY * 5.0;
+    vec3 o = o0 + dir * epsSeg;
+
+    float expectedT = dot(p1 - o, dir);
+    if (expectedT <= 0.0) return false;
+
+    uint prim;
+    float tHit;
+    vec2 bary;
+    if (!traceClosestMaxT(o, dir, expectedT + epsSeg, prim, tHit, bary)) {
+        return false;
+    }
+
+    if (int(prim) != expectedTri) {
+        return false;
+    }
+
+    return abs(tHit - expectedT) < epsSeg * 2.0;
+}
+
+bool segmentHitsExpectedQuad(
+    vec3 o0,
+    vec3 p1,
+    int expectedTri
+) {
+    if (expectedTri < 0) return false;
+
+    vec3 d = p1 - o0;
+    float dist2 = dot(d, d);
+    if (dist2 <= 1e-12) return false;
+
+    float dist = sqrt(dist2);
+    vec3 dir = d / dist;
+
+    float epsSeg = EPS_RAY * 5.0;
+    vec3 o = o0 + dir * epsSeg;
+
+    float expectedT = dot(p1 - o, dir);
+    if (expectedT <= 0.0) return false;
+
+    uint prim;
+    float tHit;
+    vec2 bary;
+    if (!traceClosestMaxT(o, dir, expectedT + epsSeg, prim, tHit, bary)) {
+        return false;
+    }
+
+    uint triU = uint(expectedTri);
+    uint altU = quadAlternateIfSameMat(triU);
+
+    if (prim != triU && prim != altU) {
+        return false;
+    }
+
+    return abs(tHit - expectedT) < epsSeg * 2.0;
+}
+
+bool validateSegmentHit(
+    vec3 a,
+    vec3 b,
+    uint expectedPrim,
+    out float outT
+) {
+    vec3 d = b - a;
+    float dist = length(d);
+    if (dist <= 1e-8) {
+        outT = 0.0;
+        return false;
+    }
+
+    vec3 rd = d / dist;
+    uint prim;
+    float tHit;
+    vec2 bary;
+    if (!traceClosestMaxT(a, rd, dist + 1e-4, prim, tHit, bary)) {
+        outT = 0.0;
+        return false;
+    }
+
+    outT = tHit;
+    return prim == expectedPrim;
+}
+
+bool sampleTransmissivePoint(
+    inout uint rng,
+    uint transmissiveCount,
+    vec3 receiverPos,
+    out uint triIndex,
+    out vec3 x,
+    out vec3 N,
+    out float ior,
+    out float pdfAreaOnSurface,
+    out vec2 uv
+) {
+    if (transmissiveCount == 0u) return false;
+
+    uint slot = sampleTransmissiveTriangle(rand01(rng), transmissiveCount);
+    triIndex = transmissiveTriangles[slot].triIndex_pad.x;
+
+    float triArea = transmissiveTriangles[slot].area_pmf_cdf_pad.x;
+    float triPmf  = transmissiveTriangles[slot].area_pmf_cdf_pad.y;
+    if (triArea <= 0.0 || triPmf <= 0.0) return false;
+
+    vec3 a, b, c;
+    loadTriangle(triIndex, a, b, c);
+
+    vec3 Ng = triangleNormal(a, b, c);
+    N = dot(Ng, receiverPos - baryToPoint(vec3(1.0/3.0), a, b, c)) > 0.0 ? Ng : -Ng;
+
+    Material m = materials[triangleMaterialIndices[triIndex]];
+    ior = m.metallic_smoothShading_transmission_ior.w;
+
+    vec3 planeP = receiverPos - N * dot(receiverPos - a, N);
+
+    vec3 bcCenter;
+    bool haveProj = pointToTriangleBary(planeP, a, b, c, bcCenter);
+
+    if (!haveProj || any(lessThan(bcCenter, vec3(0.0)))) {
+        vec3 rawBc;
+        pointToTriangleBary(planeP, a, b, c, rawBc);
+        rawBc = max(rawBc, vec3(0.0));
+        float s = rawBc.x + rawBc.y + rawBc.z;
+        if (s > 1e-8) {
+            bcCenter = rawBc / s;
+        } else {
+            bcCenter = vec3(1.0 / 3.0);
+        }
+    }
+
+    const float guideMix  = 0.9;
+    const float sigmaBary = 0.12;
+
+    vec3 bc;
+    float pdfGuidedLocal = 0.0;
+    bool usedGuided = false;
+
+    if (rand01(rng) < guideMix) {
+        if (sampleTriangleGuidedBary(bcCenter, sigmaBary, rng, bc, pdfGuidedLocal)) {
+            usedGuided = true;
+        }
+    }
+
+    if (!usedGuided) {
+        vec2 u = sampleUniformTriangle(vec2(rand01(rng), rand01(rng)));
+        bc = vec3(1.0 - u.x - u.y, u.x, u.y);
+    }
+
+    x = baryToPoint(bc, a, b, c);
+    uv = vec2(bc.y, bc.z);
+
+    float pdfUniformArea = triPmf / triArea;
+
+    float pdfGuidedArea = triPmf * pdfGuidedLocal / max(triArea, 1e-8);
+
+    if (usedGuided) {
+        pdfAreaOnSurface =
+            guideMix * pdfGuidedArea +
+            (1.0 - guideMix) * pdfUniformArea;
+    } else {
+        pdfAreaOnSurface =
+            (1.0 - guideMix) * pdfUniformArea;
+    }
+
+    if (!usedGuided) {
+        vec3 d = bc - bcCenter;
+        float dv = d.y;
+        float dw = d.z;
+        float g = exp(-0.5 * (dv * dv + dw * dw) / max(sigmaBary * sigmaBary, 1e-8));
+        float guidedAtSample = g / max(2.0 * PI * sigmaBary * sigmaBary, 1e-8);
+        float guidedAreaAtSample = triPmf * guidedAtSample / max(triArea, 1e-8);
+
+        pdfAreaOnSurface =
+            guideMix * guidedAreaAtSample +
+            (1.0 - guideMix) * pdfUniformArea;
+    }
+
+    return pdfAreaOnSurface > 0.0;
+}
+
+bool predictGuidedLightPoint(
+    vec3 receiverPos,
+    vec3 receiverN,
+    vec3 xt,
+    vec3 Nt,
+    float ior,
+    bool frontFaceAtXt,
+    vec3 lightA,
+    vec3 lightB,
+    vec3 lightC,
+    out vec3 yPred
+) {
+    vec3 wi = normalize(xt - receiverPos);
+
+    float etaI = 1.0;
+    float etaT = ior;
+
+    vec3 dirInside;
+    if (!refractDir(wi, Nt, etaI / etaT, dirInside)) {
+        dirInside = reflect(wi, Nt);
+    }
+
+    vec3 lightN = triangleNormal(lightA, lightB, lightC);
+    float denom = dot(lightN, dirInside);
+    if (abs(denom) < 1e-6) {
+        return false;
+    }
+
+    float tPlane = dot(lightN, lightA - xt) / denom;
+    if (tPlane <= 0.0) {
+        return false;
+    }
+
+    yPred = xt + dirInside * tPlane;
+    return true;
+}
+
+MneeSeed buildMneeSeed(
+    vec3 x0,
+    vec3 n0,
+    vec3 y,
+    float lambda,
+    uint tri0,
+    vec2 uv0
+) {
+    MneeSeed s;
+    s.count = 0u;
+    for (uint i = 0u; i < 3u; ++i) {
+        s.tri[i] = 0u;
+        s.uv[i]  = vec2(0.0);
+        s.evt[i] = EVT_REFRACT;
+    }
+
+    // First event is provided by the receiver-dependent seed point.
+    s.count = 1u;
+    s.tri[0] = tri0;
+    s.uv[0]  = uv0;
+    s.evt[0] = EVT_REFRACT;
+
+    vec3 p0 = triPointUnclamped(tri0, uv0);
+
+    vec3 d01 = y - p0;
+    float dist01 = length(d01);
+    if (dist01 <= 1e-8) {
+        return s;
+    }
+
+    vec3 rayD = d01 / dist01;
+    vec3 rayO = p0 + rayD * EPS;
+    float tRemain = dist01 - EPS;
+
+    // Find up to one more transmissive event on the way to the light.
+    // That gives the common 2-refraction caustic case.
+    for (uint i = 1u; i < 2u; ++i) {
+        if (tRemain <= 1e-5) break;
+
+        uint triHit;
+        float tHit;
+        vec2 uvHit;
+        if (!traceClosestMaxT(rayO, rayD, tRemain, triHit, tHit, uvHit)) {
+            break;
+        }
+
+        // Skip self / same quad partner if needed
+        if (triHit == s.tri[i - 1u] || triHit == quadAlternateIfSameMat(s.tri[i - 1u])) {
+            float adv = tHit + EPS;
+            rayO += rayD * adv;
+            tRemain -= adv;
+            continue;
+        }
+
+        Material matHit = materials[triangleMaterialIndices[triHit]];
+        if (!isMneeSpecular(matHit)) {
+            break;
+        }
+
+        s.tri[s.count] = triHit;
+        s.uv[s.count]  = uvHit;
+        s.evt[s.count] = EVT_REFRACT;
+        s.count++;
+
+        float adv = tHit + EPS;
+        rayO += rayD * adv;
+        tRemain -= adv;
+    }
+
+    // Optional refract-reflect-refract extension, same spirit as your old builder.
+    if (s.count < 2u) {
+        return s;
+    }
+
+    vec3 p1 = triPointUnclamped(s.tri[1], s.uv[1]);
+    vec3 wi = normalize(p1 - p0);
+
+    vec3 n1 = triNormalFlat(s.tri[1]);
+    float etaGlass = materialIorAtLambda(s.tri[1], lambda);
+
+    float etaI = etaGlass;
+    float etaT = 1.0;
+
+    if (dot(wi, n1) > 0.0) {
+        n1 = -n1;
+        float tmp = etaI;
+        etaI = etaT;
+        etaT = tmp;
+    }
+
+    vec3 tdir;
+    bool hasTransmit = refractDir(wi, n1, etaI / etaT, tdir);
+
+    bool wantsReflect = !hasTransmit;
+    if (!wantsReflect) {
+        return s;
+    }
+
+    vec3 rdir = reflect(wi, n1);
+    vec3 o2 = p1 + rdir * EPS;
+
+    uint tri2;
+    float t2;
+    vec2 uv2;
+    if (!traceClosestMaxT(o2, rdir, INF_T, tri2, t2, uv2)) {
+        return s;
+    }
+
+    if (!isDeltaTransmissivePrim(tri2)) {
+        return s;
+    }
+
+    s.count = 3u;
+    s.evt[0] = EVT_REFRACT;
+    s.evt[1] = EVT_REFLECT;
+    s.tri[2] = tri2;
+    s.uv[2]  = uv2;
+    s.evt[2] = EVT_REFRACT;
+
+    return s;
+}
+
+vec2 specConstraintReflect(
+    vec3 prevP,
+    vec3 thisP,
+    vec3 nextP,
+    uint triId
+) {
+    vec3 wi = normalize(thisP - prevP);
+
+    vec3 n = triNormalFlat(triId);
+    if (dot(wi, n) > 0.0) {
+        n = -n;
+    }
+
+    vec3 rdir = reflect(wi, n);
+    vec3 wo   = normalize(nextP - thisP);
+
+    vec3 T, B;
+    tangentBasisFromN(n, T, B);
+
+    vec3 diff = wo - rdir;
+    return vec2(dot(diff, T), dot(diff, B));
+}
+
+vec2 specConstraintRefract(
+    vec3 prevP,
+    vec3 thisP,
+    vec3 nextP,
+    uint triId,
+    float etaFrom,
+    float etaTo,
+    float lambda
+) {
+    vec3 wi = normalize(thisP - prevP);
+
+    vec3 n = triNormalFlat(triId);
+
+    float etaI = etaFrom;
+    float etaT = etaTo;
+
+    if (dot(wi, n) > 0.0) {
+        n = -n;
+        float tmp = etaI;
+        etaI = etaT;
+        etaT = tmp;
+    }
+
+    vec3 tdir;
+    if (!refractDir(wi, n, etaI / etaT, tdir)) {
+        return vec2(1e3, 1e3);
+    }
+
+    vec3 wo = normalize(nextP - thisP);
+
+    vec3 T, B;
+    tangentBasisFromN(n, T, B);
+
+    vec3 diff = wo - normalize(tdir);
+    return vec2(dot(diff, T), dot(diff, B));
+}
+
+bool solveLinear2(mat2 A, vec2 b, out vec2 x) {
+    float det = A[0][0] * A[1][1] - A[0][1] * A[1][0];
+    if (abs(det) < 1e-10) {
+        x = vec2(0.0);
+        return false;
+    }
+
+    float invDet = 1.0 / det;
+    x = vec2(
+        ( b.x * A[1][1] - b.y * A[0][1]) * invDet,
+        (-b.x * A[1][0] + b.y * A[0][0]) * invDet
+    );
+    return true;
+}
+
+bool solveLinear6(in float Ain[6][6], in float bin[6], out float x[6], out float detOut) {
+    float M[6][7];
+
+    for (int r = 0; r < 6; ++r) {
+        for (int c = 0; c < 6; ++c) {
+            M[r][c] = Ain[r][c];
+        }
+        M[r][6] = bin[r];
+    }
+
+    detOut = 1.0;
+
+    for (int k = 0; k < 6; ++k) {
+        int piv = k;
+        float best = abs(M[k][k]);
+
+        for (int r = k + 1; r < 6; ++r) {
+            float v = abs(M[r][k]);
+            if (v > best) {
+                best = v;
+                piv = r;
+            }
+        }
+
+        if (best < 1e-10) {
+            for (int i = 0; i < 6; ++i) x[i] = 0.0;
+            detOut = 0.0;
+            return false;
+        }
+
+        if (piv != k) {
+            for (int c = k; c < 7; ++c) {
+                float tmp = M[k][c];
+                M[k][c] = M[piv][c];
+                M[piv][c] = tmp;
+            }
+            detOut = -detOut;
+        }
+
+        float pivot = M[k][k];
+        detOut *= pivot;
+
+        float invPivot = 1.0 / pivot;
+        for (int c = k; c < 7; ++c) {
+            M[k][c] *= invPivot;
+        }
+
+        for (int r = 0; r < 6; ++r) {
+            if (r == k) continue;
+            float f = M[r][k];
+            if (abs(f) < 1e-12) continue;
+
+            for (int c = k; c < 7; ++c) {
+                M[r][c] -= f * M[k][c];
+            }
+        }
+    }
+
+    for (int i = 0; i < 6; ++i) {
+        x[i] = M[i][6];
+    }
+    return true;
+}
+
+vec2 mneeConstraints1(
+    vec3 x0,
+    vec3 y,
+    MneeSeed seed,
+    float lambda
+) {
+    vec3 x[3];
+    x[0] = triPointUnclamped(seed.tri[0], seed.uv[0]);
+
+    vec3 prevP = x0;
+    vec3 thisP = x[0];
+    vec3 nextP = y;
+
+    if (seed.evt[0] == EVT_REFLECT) {
+        return specConstraintReflect(prevP, thisP, nextP, seed.tri[0]);
+    } else {
+        Material matS = materials[triangleMaterialIndices[seed.tri[0]]];
+        float etaMat = materialIorAtLambda(seed.tri[0], lambda);
+
+        float etaFrom = 1.0;
+        float etaTo   = etaMat;
+
+        return specConstraintRefract(prevP, thisP, nextP, seed.tri[0], etaFrom, etaTo, lambda);
+    }
+}
+
+vec4 mneeConstraints2(
+    vec3 x0,
+    vec3 y,
+    MneeSeed seed,
+    float lambda
+) {
+    vec3 x[3];
+    x[0] = triPointUnclamped(seed.tri[0], seed.uv[0]);
+    x[1] = triPointUnclamped(seed.tri[1], seed.uv[1]);
+
+    vec4 C = vec4(0.0);
+
+    float etaFrom = 1.0;
+
+    for (uint i = 0u; i < 2u; ++i) {
+        vec3 prevP = (i == 0u) ? x0 : x[i - 1u];
+        vec3 thisP = x[i];
+        vec3 nextP = (i == 1u) ? y : x[i + 1u];
+
+        vec2 c;
+        if (seed.evt[i] == EVT_REFLECT) {
+            c = specConstraintReflect(prevP, thisP, nextP, seed.tri[i]);
+        } else {
+            float etaMat = materialIorAtLambda(seed.tri[i], lambda);
+            float etaTo = (etaFrom == 1.0) ? etaMat : 1.0;
+            c = specConstraintRefract(prevP, thisP, nextP, seed.tri[i], etaFrom, etaTo, lambda);
+            etaFrom = etaTo;
+        }
+
+        C[int(2u * i + 0u)] = c.x;
+        C[int(2u * i + 1u)] = c.y;
+    }
+
+    return C;
+}
+
+void mneeConstraints3(
+    vec3 x0,
+    vec3 y,
+    MneeSeed seed,
+    float lambda,
+    out float C[6]
+) {
+    for (int k = 0; k < 6; ++k) C[k] = 0.0;
+
+    vec3 x[3];
+    x[0] = triPointUnclamped(seed.tri[0], seed.uv[0]);
+    x[1] = triPointUnclamped(seed.tri[1], seed.uv[1]);
+    x[2] = triPointUnclamped(seed.tri[2], seed.uv[2]);
+
+    float etaFrom = 1.0;
+
+    for (uint i = 0u; i < 3u; ++i) {
+        vec3 prevP = (i == 0u) ? x0 : x[i - 1u];
+        vec3 thisP = x[i];
+        vec3 nextP = (i == 2u) ? y : x[i + 1u];
+
+        vec2 c;
+        if (seed.evt[i] == EVT_REFLECT) {
+            c = specConstraintReflect(prevP, thisP, nextP, seed.tri[i]);
+        } else {
+            float etaMat = materialIorAtLambda(seed.tri[i], lambda);
+            float etaTo = (etaFrom == 1.0) ? etaMat : 1.0;
+            c = specConstraintRefract(prevP, thisP, nextP, seed.tri[i], etaFrom, etaTo, lambda);
+            etaFrom = etaTo;
+        }
+
+        C[int(2u * i + 0u)] = c.x;
+        C[int(2u * i + 1u)] = c.y;
+    }
+}
+
+mat4 mneeJacobian2FiniteDiff(
+    vec3 x0,
+    vec3 y,
+    MneeSeed s,
+    float lambda
+) {
+    vec4 C0 = mneeConstraints2(x0, y, s, lambda);
+
+    MneeSeed sp;
+    vec4 C1, d0, d1, d2, d3;
+
+    sp = s;
+    sp.uv[0] += vec2(MNEE_EPS_UV, 0.0);
+    C1 = mneeConstraints2(x0, y, sp, lambda);
+    d0 = (C1 - C0) / MNEE_EPS_UV;
+
+    sp = s;
+    sp.uv[0] += vec2(0.0, MNEE_EPS_UV);
+    C1 = mneeConstraints2(x0, y, sp, lambda);
+    d1 = (C1 - C0) / MNEE_EPS_UV;
+
+    sp = s;
+    sp.uv[1] += vec2(MNEE_EPS_UV, 0.0);
+    C1 = mneeConstraints2(x0, y, sp, lambda);
+    d2 = (C1 - C0) / MNEE_EPS_UV;
+
+    sp = s;
+    sp.uv[1] += vec2(0.0, MNEE_EPS_UV);
+    C1 = mneeConstraints2(x0, y, sp, lambda);
+    d3 = (C1 - C0) / MNEE_EPS_UV;
+
+    mat4 J = mat4(0.0);
+    J[0] = vec4(d0.x, d0.y, d0.z, d0.w);
+    J[1] = vec4(d1.x, d1.y, d1.z, d1.w);
+    J[2] = vec4(d2.x, d2.y, d2.z, d2.w);
+    J[3] = vec4(d3.x, d3.y, d3.z, d3.w);
+    return J;
+}
+
+float maxAbsVec4(vec4 v) {
+    return max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
+}
+
+vec4 mulMat4Vec4(mat4 A, vec4 x) {
+    // Your solveLinear4 treats A[c][r] as column-major and solves with that convention.
+    // J * x in GLSL already matches that layout.
+    return A * x;
+}
+
+void broydenUpdateGood4(
+    inout mat4 J,
+    vec4 sStep,
+    vec4 yDiff
+) {
+    float denom = dot(sStep, sStep);
+    if (denom <= 1e-12) return;
+
+    vec4 Js = mulMat4Vec4(J, sStep);
+    vec4 u = yDiff - Js;
+
+    // Good Broyden:
+    // J_{k+1} = J_k + ((y - J s) s^T) / (s^T s)
+    J[0] += u * (sStep.x / denom);
+    J[1] += u * (sStep.y / denom);
+    J[2] += u * (sStep.z / denom);
+    J[3] += u * (sStep.w / denom);
+}
+
+bool mneeSolveStep2(
+    vec3 x0,
+    vec3 y,
+    float lambda,
+    vec4 C0,
+    inout MneeSeed s,
+    inout mat4 J,
+    out vec4 C1,
+    out float stepScaleUsed
+) {
+    C1 = C0;
+    stepScaleUsed = 0.0;
+
+    vec4 step;
+    if (!solveLinear4(J, -C0, step)) {
+        return false;
+    }
+
+    // UV trust region
+    float maxStep = 0.10;
+    float smax = maxAbsVec4(step);
+    if (smax > maxStep) {
+        step *= maxStep / smax;
+    }
+
+    float alpha = 1.0;
+    float err0 = dot(C0, C0);
+
+    for (int ls = 0; ls < 6; ++ls) {
+        MneeSeed cand = s;
+        cand.uv[0] += alpha * step.xy;
+        cand.uv[1] += alpha * step.zw;
+
+        if (!pointInTriBary(cand.uv[0]) || !pointInTriBary(cand.uv[1])) {
+            alpha *= 0.5;
+            continue;
+        }
+
+        vec4 Ccand = mneeConstraints2(x0, y, cand, lambda);
+        float err1 = dot(Ccand, Ccand);
+
+        if (err1 < err0) {
+            s = cand;
+            C1 = Ccand;
+            stepScaleUsed = alpha;
+            return true;
+        }
+
+        alpha *= 0.5;
+    }
+
+    return false;
+}
+
+MneeSolve mneeNewtonsSolve(
+    vec3 x0,
+    vec3 y,
+    float lambda,
+    MneeSeed seed0
+) {
+    MneeSolve outSolve;
+    outSolve.ok = false;
+    outSolve.invAbsDetJ = 0.0;
+    outSolve.seed = seed0;
+
+    MneeSeed s = seed0;
+    if (s.count == 0u) {
+        return outSolve;
+    }
+
+    float invAbsDetJ = 0.0;
+
+    const uint MNEE_ITERS = 3u;
+
+    for (uint it = 0u; it < MNEE_ITERS; ++it) {
+        if (s.count == 1u) {
+            vec2 C0 = mneeConstraints1(x0, y, s, lambda);
+            if (maxAbsConstraint2(C0) < MNEE_EPS_C) {
+                outSolve.ok = true;
+                outSolve.invAbsDetJ = invAbsDetJ;
+                outSolve.seed = s;
+                return outSolve;
+            }
+
+            MneeSeed sp = s;
+            sp.uv[0] += vec2(MNEE_EPS_UV, 0.0);
+            vec2 Cp = mneeConstraints1(x0, y, sp, lambda);
+            vec2 J0 = (Cp - C0) / MNEE_EPS_UV;
+
+            sp = s;
+            sp.uv[0] += vec2(0.0, MNEE_EPS_UV);
+            vec2 Cq = mneeConstraints1(x0, y, sp, lambda);
+            vec2 J1 = (Cq - C0) / MNEE_EPS_UV;
+
+            mat2 A = mat2(J0, J1);
+            float detJ = A[0][0] * A[1][1] - A[0][1] * A[1][0];
+            if (abs(detJ) < 1e-10) {
+                return outSolve;
+            }
+
+            invAbsDetJ = abs(1.0 / detJ);
+
+            vec2 delta;
+            if (!solveLinear2(A, -C0, delta)) {
+                return outSolve;
+            }
+
+            s.uv[0] += delta;
+        }
+        else if (s.count == 2u) {
+            vec4 C = mneeConstraints2(x0, y, s, lambda);
+
+            if (maxAbsConstraint4(C) < MNEE_EPS_C) {
+                mat4 J0 = mneeJacobian2FiniteDiff(x0, y, s, lambda);
+                float detJ0 = determinant(J0);
+                if (abs(detJ0) < 1e-10) {
+                    return outSolve;
+                }
+
+                outSolve.ok = true;
+                outSolve.invAbsDetJ = abs(1.0 / detJ0);
+                outSolve.seed = s;
+                return outSolve;
+            }
+
+            mat4 J = mneeJacobian2FiniteDiff(x0, y, s, lambda);
+            float detJ = determinant(J);
+            if (abs(detJ) < 1e-10) {
+                return outSolve;
+            }
+
+            invAbsDetJ = abs(1.0 / detJ);
+
+            const int MAX_ITERS_2 = 3;
+            int refreshCountdown = 0;
+
+            for (int it2 = 0; it2 < MAX_ITERS_2; ++it2) {
+                vec4 Cold = C;
+                MneeSeed sold = s;
+
+                vec4 Cnew;
+                float alphaUsed;
+                bool accepted = mneeSolveStep2(x0, y, lambda, C, s, J, Cnew, alphaUsed);
+                if (!accepted) {
+                    if (refreshCountdown == 0) {
+                        J = mneeJacobian2FiniteDiff(x0, y, sold, lambda);
+                        float detJr = determinant(J);
+                        if (abs(detJr) < 1e-10) {
+                            return outSolve;
+                        }
+                        invAbsDetJ = abs(1.0 / detJr);
+                        refreshCountdown = 1;
+
+                        s = sold;
+                        C = Cold;
+                        continue;
+                    }
+                    return outSolve;
+                }
+
+                C = Cnew;
+
+                if (maxAbsConstraint4(C) < MNEE_EPS_C) {
+                    float detJa = determinant(J);
+                    if (abs(detJa) > 1e-10) {
+                        invAbsDetJ = abs(1.0 / detJa);
+                    } else {
+                        J = mneeJacobian2FiniteDiff(x0, y, s, lambda);
+                        detJa = determinant(J);
+                        if (abs(detJa) < 1e-10) {
+                            return outSolve;
+                        }
+                        invAbsDetJ = abs(1.0 / detJa);
+                    }
+
+                    outSolve.ok = true;
+                    outSolve.invAbsDetJ = invAbsDetJ;
+                    outSolve.seed = s;
+                    return outSolve;
+                }
+
+                vec4 sStep = vec4(
+                    s.uv[0].x - sold.uv[0].x,
+                    s.uv[0].y - sold.uv[0].y,
+                    s.uv[1].x - sold.uv[1].x,
+                    s.uv[1].y - sold.uv[1].y
+                );
+                vec4 yDiff = C - Cold;
+
+                broydenUpdateGood4(J, sStep, yDiff);
+
+                if (alphaUsed < 0.25) {
+                    refreshCountdown = 0;
+                } else if (refreshCountdown > 0) {
+                    refreshCountdown--;
+                }
+
+                float detJk = determinant(J);
+                if (abs(detJk) > 1e-10) {
+                    invAbsDetJ = abs(1.0 / detJk);
+                } else {
+                    J = mneeJacobian2FiniteDiff(x0, y, s, lambda);
+                    detJk = determinant(J);
+                    if (abs(detJk) < 1e-10) {
+                        return outSolve;
+                    }
+                    invAbsDetJ = abs(1.0 / detJk);
+                }
+            }
+
+            if (maxAbsConstraint4(C) < 2.0 * MNEE_EPS_C) {
+                float detJf = determinant(J);
+                if (abs(detJf) <= 1e-10) {
+                    J = mneeJacobian2FiniteDiff(x0, y, s, lambda);
+                    detJf = determinant(J);
+                    if (abs(detJf) < 1e-10) {
+                        return outSolve;
+                    }
+                }
+
+                outSolve.ok = true;
+                outSolve.invAbsDetJ = abs(1.0 / detJf);
+                outSolve.seed = s;
+                return outSolve;
+            }
+
+            return outSolve;
+        }
+        else {
+            float C0[6];
+            mneeConstraints3(x0, y, s, lambda, C0);
+
+            float maxC = 0.0;
+            for (int k = 0; k < 6; ++k) {
+                maxC = max(maxC, abs(C0[k]));
+            }
+            if (maxC < MNEE_EPS_C) {
+                outSolve.ok = true;
+                outSolve.invAbsDetJ = invAbsDetJ;
+                outSolve.seed = s;
+                return outSolve;
+            }
+
+            float J[6][6];
+            for (int r = 0; r < 6; ++r) {
+                for (int c = 0; c < 6; ++c) {
+                    J[r][c] = 0.0;
+                }
+            }
+
+            for (uint col = 0u; col < 6u; ++col) {
+                MneeSeed sp = s;
+                uint vi = col / 2u;
+                uint uvComp = col - 2u * vi;
+
+                if (uvComp == 0u) {
+                    sp.uv[vi] += vec2(MNEE_EPS_UV, 0.0);
+                } else {
+                    sp.uv[vi] += vec2(0.0, MNEE_EPS_UV);
+                }
+
+                float Cp[6];
+                mneeConstraints3(x0, y, sp, lambda, Cp);
+
+                for (int r = 0; r < 6; ++r) {
+                    J[r][int(col)] = (Cp[r] - C0[r]) / MNEE_EPS_UV;
+                }
+            }
+
+            float b[6];
+            for (int r = 0; r < 6; ++r) {
+                b[r] = -C0[r];
+            }
+
+            float step[6];
+            float detJ;
+            if (!solveLinear6(J, b, step, detJ) || abs(detJ) < 1e-10) {
+                return outSolve;
+            }
+
+            invAbsDetJ = abs(1.0 / detJ);
+
+            s.uv[0] += vec2(step[0], step[1]);
+            s.uv[1] += vec2(step[2], step[3]);
+            s.uv[2] += vec2(step[4], step[5]);
+        }
+    }
+
+    // final accept
+    if (s.count == 1u) {
+        vec2 Cf = mneeConstraints1(x0, y, s, lambda);
+        if (maxAbsConstraint2(Cf) < 2.0 * MNEE_EPS_C) {
+            outSolve.ok = true;
+            outSolve.invAbsDetJ = invAbsDetJ;
+            outSolve.seed = s;
+        }
+    }
+    else if (s.count == 2u) {
+        vec4 Cf = mneeConstraints2(x0, y, s, lambda);
+        if (maxAbsConstraint4(Cf) < 2.0 * MNEE_EPS_C) {
+            outSolve.ok = true;
+            outSolve.invAbsDetJ = invAbsDetJ;
+            outSolve.seed = s;
+        }
+    }
+    else {
+        float Cf[6];
+        mneeConstraints3(x0, y, s, lambda, Cf);
+        float maxC = 0.0;
+        for (int k = 0; k < 6; ++k) {
+            maxC = max(maxC, abs(Cf[k]));
+        }
+        if (maxC < 2.0 * MNEE_EPS_C) {
+            outSolve.ok = true;
+            outSolve.invAbsDetJ = invAbsDetJ;
+            outSolve.seed = s;
+        }
+    }
+
+    return outSolve;
+}
+
+bool sampleMneeLightPoint(
+    vec3 receiverPos,
+    vec3 receiverN,
+    float lambda,
+    inout uint rng,
+    out uint seedTriIndex,
+    out vec3 seedPos,
+    out vec3 seedN,
+    out float seedIor,
+    out float seedPdfA,
+    out uint lightTriIndex,
+    out vec3 lightPos,
+    out vec3 lightN,
+    out float lightPdfA,
+    out vec2 seedUv
+) {
+    uint transmissiveCount = frame.transmissiveTriangleCount.x;
+    if (transmissiveCount == 0u || frame.extra.x == 0u) {
+        return false;
+    }
+
+    if (!sampleTransmissivePoint(
+            rng,
+            transmissiveCount,
+            receiverPos,
+            seedTriIndex,
+            seedPos,
+            seedN,
+            seedIor,
+            seedPdfA,
+            seedUv
+        )) {
+        return false;
+    }
+
+    uint lightSlot = sampleEmissiveTriangle(rand01(rng));
+    lightTriIndex = emissiveTriangles[lightSlot].triIndex_pad.x;
+
+    float lightArea = emissiveTriangles[lightSlot].area_pmf_cdf_pad.x;
+    float lightPmf  = emissiveTriangles[lightSlot].area_pmf_cdf_pad.y;
+    if (lightArea <= 0.0 || lightPmf <= 0.0) {
+        return false;
+    }
+
+    vec3 a, b, c;
+    loadTriangle(lightTriIndex, a, b, c);
+    lightN = triangleNormal(a, b, c);
+
+    const float guideMix = 0.9;
+    const float sigmaBary = 0.08;
+
+    vec3 bc;
+    float pdfGuidedLocal = 0.0;
+    bool usedGuided = false;
+
+    vec3 yPred;
+    vec3 bcPred;
+
+    if (predictGuidedLightPoint(
+            receiverPos,
+            receiverN,
+            seedPos,
+            seedN,
+            seedIor,
+            true,
+            a, b, c,
+            yPred) &&
+        pointToTriangleBary(yPred, a, b, c, bcPred)) {
+
+        if (rand01(rng) < guideMix) {
+            if (sampleTriangleGuidedBary(bcPred, sigmaBary, rng, bc, pdfGuidedLocal)) {
+                usedGuided = true;
+            }
+        }
+    }
+
+    if (!usedGuided) {
+        vec2 u = sampleUniformTriangle(vec2(rand01(rng), rand01(rng)));
+        bc = vec3(1.0 - u.x - u.y, u.x, u.y);
+    }
+
+    lightPos = baryToPoint(bc, a, b, c);
+
+    float pdfUniformArea = lightPmf / lightArea;
+    float pdfGuidedArea = 0.0;
+
+    if (usedGuided) {
+        pdfGuidedArea = lightPmf * pdfGuidedLocal / max(lightArea, 1e-8);
+        lightPdfA = guideMix * pdfGuidedArea + (1.0 - guideMix) * pdfUniformArea;
+    } else {
+        lightPdfA = pdfUniformArea;
+    }
+
+    return lightPdfA > 0.0;
+}
+
+float mneeAreaLightDirect(
+    vec3 x0,
+    vec3 n0,
+    vec3 V0,
+    float lambda,
+    float albedoS,
+    inout uint rng
+) {
+    if (frame.extra.x == 0u) return 0.0;
+    if (frame.transmissiveTriangleCount.x == 0u) return 0.0;
+
+    uint seedTriIndex;
+    vec3 seedPos;
+    vec3 seedN;
+    float seedIor;
+    float seedPdfA;
+    vec2 seedUv;
+
+    uint triL;
+    vec3 y;
+    vec3 lightN;
+    float lightPdfA;
+
+    if (!sampleMneeLightPoint(
+            x0,
+            n0,
+            lambda,
+            rng,
+            seedTriIndex,
+            seedPos,
+            seedN,
+            seedIor,
+            seedPdfA,
+            triL,
+            y,
+            lightN,
+            lightPdfA,
+            seedUv)) {
+        return 0.0;
+    }
+
+    // Receiver-dependent seed chain
+    MneeSeed seed = buildMneeSeed(
+        x0, n0, y, lambda, seedTriIndex, seedUv
+    );
+    bool seedOk = false;
+    float seedErr = 1e30;
+
+    if (seed.count == 1u) {
+        vec2 C0 = mneeConstraints1(x0, y, seed, lambda);
+        seedErr = maxAbsConstraint2(C0);
+        seedOk = (seedErr < MNEE_MAX_INITIAL_ERR_1);
+    }
+    else if (seed.count == 2u) {
+        vec4 C0 = mneeConstraints2(x0, y, seed, lambda);
+        seedErr = maxAbsConstraint4(C0);
+        seedOk = (seedErr < MNEE_MAX_INITIAL_ERR_2);
+    }
+    else {
+        float C0[6];
+        mneeConstraints3(x0, y, seed, lambda, C0);
+        float maxC = 0.0;
+        for (int i = 0; i < 6; ++i) maxC = max(maxC, abs(C0[i]));
+        seedErr = maxC;
+        seedOk = (seedErr < MNEE_MAX_INITIAL_ERR_3);
+    }
+
+    if (!seedOk) {
+        return 0.0;
+    }
+
+    MneeSolve sol = mneeNewtonsSolve(x0, y, lambda, seed);
+
+    if (!sol.ok) {
+        MneeSeed altSeed = seed;
+        for (uint i = 0u; i < altSeed.count; ++i) {
+            altSeed.tri[i] = quadAlternateIfSameMat(altSeed.tri[i]);
+        }
+        sol = mneeNewtonsSolve(x0, y, lambda, altSeed);
+    }
+
+    if (!sol.ok || sol.invAbsDetJ <= 0.0) {
+        return 0.0;
+    }
+
+    uint count = sol.seed.count;
+
+    vec3 x[3];
+    x[0] = triPointUnclamped(sol.seed.tri[0], sol.seed.uv[0]);
+    if (count > 1u) x[1] = triPointUnclamped(sol.seed.tri[1], sol.seed.uv[1]);
+    if (count > 2u) x[2] = triPointUnclamped(sol.seed.tri[2], sol.seed.uv[2]);
+
+    float Jmetric = 1.0;
+    for (uint i = 0u; i < count; ++i) {
+        Jmetric *= triAreaJacobianUv(sol.seed.tri[i]);
+    }
+
+    float invAbsDetJCorrect = sol.invAbsDetJ * Jmetric;
+    if (invAbsDetJCorrect <= 0.0) {
+        return 0.0;
+    }
+
+    vec3 xLast = x[count - 1u];
+
+    vec3 dirFirst = normalize(x[0] - x0);
+
+    uint firstHitTri;
+    float firstHitT;
+    vec2 firstHitUv;
+    if (!traceClosestMaxT(
+            x0 + n0 * EPS,
+            dirFirst,
+            INF_T,
+            firstHitTri,
+            firstHitT,
+            firstHitUv)) {
+        return 0.0;
+    }
+
+    uint wantMat = triangleMaterialIndices[sol.seed.tri[0]];
+    uint hitMat  = triangleMaterialIndices[firstHitTri];
+
+    // First segment: only require that the first actual hit belongs
+    // to the same material as the solved first spec surface.
+    if (hitMat != wantMat) {
+        return 0.0;
+    }
+
+    // Snap the first manifold vertex to the actual traced hit.
+    sol.seed.tri[0] = firstHitTri;
+    sol.seed.uv[0]  = firstHitUv;
+    x[0] = triPointUnclamped(firstHitTri, firstHitUv);
+
+    for (uint i = 1u; i < count; ++i) {
+        if (!segmentHitsExpectedQuad(x[i - 1u], x[i], int(sol.seed.tri[i]))) {
+            return 0.0;
+        }
+    }
+
+    if (!segmentHitsExpectedQuad(xLast, y, int(triL))) {
+        return 0.0;
+    }
+
+    float Gprod = 1.0;
+    vec3 prev = x0;
+    vec3 prevN = n0;
+
+    for (uint i = 0u; i < count; ++i) {
+        vec3 curr = x[i];
+        vec3 d = curr - prev;
+        float dist2 = dot(d, d);
+        if (dist2 <= 1e-12) return 0.0;
+
+        vec3 wi = normalize(d);
+        vec3 currN = triNormalFlat(sol.seed.tri[i]);
+
+        float cosA = abs(dot(prevN, wi));
+        float cosB = abs(dot(currN, -wi));
+
+        Gprod *= (cosA * cosB) / max(dist2, 1e-8);
+
+        prev = curr;
+        prevN = currN;
+    }
+
+    vec3 L0 = normalize(x[0] - x0);
+    float NoL0 = max(dot(n0, L0), 0.0);
+    if (NoL0 <= 0.0) return 0.0;
+
+    float f0 = albedoS / PI;
+    if (f0 <= 0.0) return 0.0;
+
+    float specW = 1.0;
+    float etaFrom = 1.0;
+    float TrGlass = 1.0;
+    bool inGlass = false;
+    float sigmaA_glass = 0.0;
+
+    for (uint i = 0u; i < count; ++i) {
+        uint triS = sol.seed.tri[i];
+        Material matS = materials[triangleMaterialIndices[triS]];
+        float etaMat = materialIorAtLambda(triS, lambda);
+
+        vec3 prevP = (i == 0u) ? x0 : x[i - 1u];
+        vec3 thisP = x[i];
+        vec3 nextP = (i + 1u < count) ? x[i + 1u] : y;
+
+        vec3 wi = normalize(thisP - prevP);
+        vec3 n = triNormalFlat(triS);
+
+        float tr = clamp(matS.metallic_smoothShading_transmission_ior.z, 0.0, 1.0);
+        float tintS = clamp(rgb_to_reflectance_spectrum(lambda, matS.albedo_smoothness.xyz), 0.0, 1.0);
+        float surfTintT = mix(1.0, tintS, tr);
+        float surfTintR = mix(1.0, tintS, 0.05 * tr);
+
+        if (sol.seed.evt[i] == EVT_REFLECT) {
+            float etaI = etaFrom;
+            float etaT = (etaFrom == 1.0) ? etaMat : 1.0;
+
+            if (dot(wi, n) > 0.0) {
+                n = -n;
+                float tmp = etaI;
+                etaI = etaT;
+                etaT = tmp;
+            }
+
+            vec3 tdir;
+            bool hasTransmit = refractDir(wi, n, etaI / etaT, tdir);
+
+            if (!hasTransmit) {
+                specW *= surfTintR;
+            } else {
+                float cosI = abs(dot(-wi, n));
+                float F = fresnelDielectric(cosI, etaI, etaT);
+                specW *= F * surfTintR;
+            }
+        } else {
+            float etaI = etaFrom;
+            float etaT = (etaFrom == 1.0) ? etaMat : 1.0;
+
+            if (dot(wi, n) > 0.0) {
+                n = -n;
+                float tmp = etaI;
+                etaI = etaT;
+                etaT = tmp;
+            }
+
+            float cosI = abs(dot(-wi, n));
+            float F = fresnelDielectric(cosI, etaI, etaT);
+
+            specW *= tr * (1.0 - F) * surfTintT;
+
+            float eta2 = (etaI * etaI) / max(etaT * etaT, 1e-8);
+            specW *= eta2;
+
+            bool wasAir = (etaFrom == 1.0);
+            if (wasAir) {
+                inGlass = true;
+                sigmaA_glass = -log(max(tintS, MIN_T)) * GLASS_ABSORB_SCALE * tr;
+            } else {
+                inGlass = false;
+            }
+
+            etaFrom = etaT;
+        }
+
+        if (specW <= 0.0) return 0.0;
+
+        if ((i + 1u) < count && inGlass) {
+            float dIn = length(x[i + 1u] - thisP);
+            TrGlass *= exp(-sigmaA_glass * dIn);
+        }
+    }
+
+    TrGlass = max(TrGlass, GLASS_MIN_TRANSMIT);
+
+    vec3 toL = y - xLast;
+    float dist2 = dot(toL, toL);
+    if (dist2 <= 1e-12) return 0.0;
+
+    vec3 wiL = normalize(toL);
+    float cosL = max(dot(lightN, -wiL), 0.0);
+    if (cosL <= 0.0) return 0.0;
+
+    uint lightMatIndex = triangleMaterialIndices[triL];
+    Material lightMat = materials[lightMatIndex];
+    vec3 LeRGB = lightMat.emissive_emissiveIntensity.xyz * lightMat.emissive_emissiveIntensity.w;
+    float LeS = rgb_to_emission_spectrum(lambda, LeRGB);
+    if (LeS <= 0.0) return 0.0;
+
+    float contrib =
+        Gprod *
+        LeS *
+        f0 *
+        NoL0 *
+        specW *
+        invAbsDetJCorrect *
+        TrGlass *
+        (cosL / max(dist2, 1e-8)) /
+        max(lightPdfA, 1e-12);
+
+    return max(contrib, 0.0);
+}
+
 void main() {
     uvec2 pix = gl_GlobalInvocationID.xy;
     uint width = frame.screen.x;
@@ -1408,6 +3118,7 @@ void main() {
 
             vec3 geomN = triangleNormal(v0, v1, v2);
             vec3 hitPos = ro + rd * tHit;
+            vec3 V = normalize(-rd);
 
             uint matIndex = triangleMaterialIndices[prim];
             Material mat = materials[matIndex];
@@ -1442,12 +3153,18 @@ void main() {
             vec3 rawShadeN = (smoothShading > 0.5) ? smoothN : Ng;
             vec3 Ns = normalize(dot(rawShadeN, Ng) >= 0.0 ? rawShadeN : -rawShadeN);
 
-            // Caustic photon gather on diffuse-ish receivers
-            if (transmission <= 0.001) {
-                float causticL = gatherCausticPhotons(hitPos, Ns, lambda, albedoS);
-                if (causticL > 0.0) {
-                    radianceXYZ += (throughput * frame.misc.x * causticL) * lambdaXYZ;
-                }
+            // Screen-space caustic lookup on primary diffuse-ish receivers
+            if (bounce == 0u && transmission <= 0.001 && metallic < 0.2 && smoothness < 0.3) {
+                vec3 causticXYZ = sampleCausticsImageXYZ(ivec2(pix));
+
+                vec3 diffuseRGB = albedo / PI;
+
+                vec3 causticRGB = xyz_to_linear_srgb(causticXYZ);
+                causticRGB *= diffuseRGB;
+
+                vec3 causticReflectedXYZ = linear_srgb_to_xyz(causticRGB);
+
+                radianceXYZ += throughput * frame.misc.x * causticReflectedXYZ;
             }
 
             if (max(emissive.r, max(emissive.g, emissive.b)) > 0.0) {
@@ -1459,8 +3176,6 @@ void main() {
 
                 radianceXYZ += (throughput * emissiveS * wEmit) * lambdaXYZ;
             }
-
-            vec3 V = normalize(-rd);
 
             // Store to output textures for denoising
             if (bounce == 0u) {
