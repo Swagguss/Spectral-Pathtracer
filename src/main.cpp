@@ -260,6 +260,131 @@ static void uploadMaterials(
     );
 }
 
+static bool ComplexPlaneControl(
+    const char* label,
+    float* xValue,
+    float* yValue,
+    float xMin,
+    float xMax,
+    float yMin,
+    float yMax,
+    const ImVec2& size = ImVec2(220.0f, 220.0f)
+) {
+    bool changed = false;
+
+    ImGui::PushID(label);
+    ImGui::TextUnformatted(label);
+
+    ImVec2 canvasPos = ImGui::GetCursorScreenPos();
+    ImVec2 canvasSize = size;
+
+    if (canvasSize.x < 50.0f) canvasSize.x = 50.0f;
+    if (canvasSize.y < 50.0f) canvasSize.y = 50.0f;
+
+    ImGui::InvisibleButton("##complex_plane", canvasSize);
+
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+
+    const ImU32 bgCol = IM_COL32(30, 30, 34, 255);
+    const ImU32 borderCol = IM_COL32(180, 180, 180, 255);
+    const ImU32 gridCol = IM_COL32(90, 90, 100, 120);
+    const ImU32 axisCol = IM_COL32(170, 170, 190, 180);
+    const ImU32 pointCol = IM_COL32(255, 180, 60, 255);
+    const ImU32 pointColH = IM_COL32(255, 220, 120, 255);
+    const ImU32 textCol = IM_COL32(220, 220, 220, 255);
+
+    const ImVec2 p0 = canvasPos;
+    const ImVec2 p1 = ImVec2(canvasPos.x + canvasSize.x, canvasPos.y + canvasSize.y);
+
+    draw->AddRectFilled(p0, p1, bgCol, 6.0f);
+    draw->AddRect(p0, p1, borderCol, 6.0f, 0, 1.0f);
+
+    // Grid
+    const int gridLines = 4;
+    for (int i = 1; i < gridLines; ++i) {
+        float tx = static_cast<float>(i) / static_cast<float>(gridLines);
+        float ty = static_cast<float>(i) / static_cast<float>(gridLines);
+
+        float gx = p0.x + tx * canvasSize.x;
+        float gy = p0.y + ty * canvasSize.y;
+
+        draw->AddLine(ImVec2(gx, p0.y), ImVec2(gx, p1.y), gridCol, 1.0f);
+        draw->AddLine(ImVec2(p0.x, gy), ImVec2(p1.x, gy), gridCol, 1.0f);
+    }
+
+    // Axis lines if 0 is within range
+    if (xMin <= 0.0f && xMax >= 0.0f) {
+        float t = (0.0f - xMin) / (xMax - xMin);
+        float ax = p0.x + t * canvasSize.x;
+        draw->AddLine(ImVec2(ax, p0.y), ImVec2(ax, p1.y), axisCol, 1.5f);
+    }
+
+    if (yMin <= 0.0f && yMax >= 0.0f) {
+        float t = (0.0f - yMin) / (yMax - yMin);
+        float ay = p1.y - t * canvasSize.y;
+        draw->AddLine(ImVec2(p0.x, ay), ImVec2(p1.x, ay), axisCol, 1.5f);
+    }
+
+    auto clampf = [](float v, float lo, float hi) {
+        return (v < lo) ? lo : (v > hi ? hi : v);
+        };
+
+    auto valueToScreen = [&](float xv, float yv) -> ImVec2 {
+        float tx = (xv - xMin) / (xMax - xMin);
+        float ty = (yv - yMin) / (yMax - yMin);
+        tx = clampf(tx, 0.0f, 1.0f);
+        ty = clampf(ty, 0.0f, 1.0f);
+        return ImVec2(
+            p0.x + tx * canvasSize.x,
+            p1.y - ty * canvasSize.y
+        );
+        };
+
+    auto screenToValue = [&](ImVec2 mp, float& outX, float& outY) {
+        float tx = (mp.x - p0.x) / canvasSize.x;
+        float ty = (p1.y - mp.y) / canvasSize.y;
+        tx = clampf(tx, 0.0f, 1.0f);
+        ty = clampf(ty, 0.0f, 1.0f);
+        outX = xMin + tx * (xMax - xMin);
+        outY = yMin + ty * (yMax - yMin);
+        };
+
+    if (active) {
+        ImVec2 mp = ImGui::GetIO().MousePos;
+        float newX, newY;
+        screenToValue(mp, newX, newY);
+
+        if (newX != *xValue || newY != *yValue) {
+            *xValue = newX;
+            *yValue = newY;
+            changed = true;
+        }
+    }
+
+    ImVec2 point = valueToScreen(*xValue, *yValue);
+
+    draw->AddCircleFilled(point, 6.0f, hovered || active ? pointColH : pointCol);
+    draw->AddCircle(point, 6.0f, IM_COL32(20, 20, 20, 255), 0, 2.0f);
+
+    // Corner labels
+    char buf[64];
+
+    snprintf(buf, sizeof(buf), "eta");
+    draw->AddText(ImVec2(p0.x + 6.0f, p0.y + 6.0f), textCol, buf);
+
+    snprintf(buf, sizeof(buf), "k");
+    draw->AddText(ImVec2(p0.x + 6.0f, p1.y - 20.0f), textCol, buf);
+
+    ImGui::Text("eta: %.4f", *xValue);
+    ImGui::Text("k: %.4f", *yValue);
+
+    ImGui::PopID();
+    return changed;
+}
+
 static bool drawMaterialEditor(MeshData& mesh, int& selectedMaterial) {
     bool changed = false;
 
@@ -304,15 +429,33 @@ static bool drawMaterialEditor(MeshData& mesh, int& selectedMaterial) {
     changed |= ImGui::SliderFloat("Metallic", &m.metallic_smoothShading_transmission_ior[0], 0.0f, 1.0f);
     changed |= ImGui::SliderFloat("Smooth Shading", &m.metallic_smoothShading_transmission_ior[1], 0.0f, 1.0f);
     changed |= ImGui::SliderFloat("Transmission", &m.metallic_smoothShading_transmission_ior[2], 0.0f, 1.0f);
-    changed |= ImGui::SliderFloat("Absorption Strength", &m.thinFilmSubstrateK_absorption_pad[1], 0.0f, 10.0f);
+    changed |= ImGui::SliderFloat("Absorption Strength", &m.thinFilmSubstrateEta_thinFilmSubstrateK_absorption_pad[2], 0.0f, 10.0f);
     changed |= ImGui::SliderFloat("IOR", &m.metallic_smoothShading_transmission_ior[3], 1.0f, 3.0f);
 
-    changed |= ImGui::SliderFloat("Dispersion", &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[0], 0.0f, 1.0f);
-    changed |= ImGui::SliderFloat("Thin Film Thickness", &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[1], 0.0f, 1000.0f);
-    changed |= ImGui::SliderFloat("Thin Film IOR", &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[2], 1.0f, 3.0f);
-    changed |= ImGui::SliderFloat("Thin Film Substrate Eta", &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[3], 1.0f, 5.0f);
+    changed |= ImGui::SliderFloat("Dispersion", &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmIorK[0], 0.0f, 1.0f);
+    changed |= ImGui::SliderFloat("Thin Film Thickness", &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmIorK[1], 0.0f, 1000.0f);
 
-    changed |= ImGui::SliderFloat("Thin Film Substrate K", &m.thinFilmSubstrateK_absorption_pad[0], 0.0f, 10.0f);
+    ImGui::Separator();
+    ImGui::Text("Thin Film Complex IOR");
+
+    changed |= ComplexPlaneControl(
+        "Thin Film (eta, k)",
+        &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmIorK[2], // eta
+        &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmIorK[3], // k
+        1.0f, 3.0f,   // eta range
+        0.0f, 3.0f    // k range
+    );
+
+    ImGui::Separator();
+    ImGui::Text("Substrate Complex IOR");
+
+    changed |= ComplexPlaneControl(
+        "Substrate (eta, k)",
+        &m.thinFilmSubstrateEta_thinFilmSubstrateK_absorption_pad[0], // eta
+        &m.thinFilmSubstrateEta_thinFilmSubstrateK_absorption_pad[1], // k
+        1.0f, 5.0f,   // eta range
+        0.0f, 10.0f   // k range
+    );
 
     ImGui::End();
     return changed;
@@ -742,12 +885,13 @@ static MeshData loadObjMesh(const std::string& path) {
     defaultMat.metallic_smoothShading_transmission_ior[2] = 0.0f;
     defaultMat.metallic_smoothShading_transmission_ior[3] = 1.5f;
 
-    defaultMat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[0] = 0.0f;
-    defaultMat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[1] = 0.0f;
-    defaultMat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[2] = 1.0f;
-    defaultMat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[3] = 1.0f;
-    defaultMat.thinFilmSubstrateK_absorption_pad[0] = 0.0f;
-    defaultMat.thinFilmSubstrateK_absorption_pad[1] = 1.0f;
+    defaultMat.dispersion_thinFilmThickness_thinFilmIor_thinFilmIorK[0] = 0.0f;
+    defaultMat.dispersion_thinFilmThickness_thinFilmIor_thinFilmIorK[1] = 0.0f;
+    defaultMat.dispersion_thinFilmThickness_thinFilmIor_thinFilmIorK[2] = 1.0f;
+    defaultMat.dispersion_thinFilmThickness_thinFilmIor_thinFilmIorK[3] = 1.0f;
+    defaultMat.thinFilmSubstrateEta_thinFilmSubstrateK_absorption_pad[0] = 1.0f;
+    defaultMat.thinFilmSubstrateEta_thinFilmSubstrateK_absorption_pad[1] = 0.0f;
+    defaultMat.thinFilmSubstrateEta_thinFilmSubstrateK_absorption_pad[2] = 1.0f;
 
     mesh.materials.push_back(defaultMat);
 

@@ -15,8 +15,8 @@ struct Material {
     vec4 albedo_smoothness;
     vec4 emissive_emissiveIntensity;
     vec4 metallic_smoothShading_transmission_ior;
-    vec4 dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta;
-    vec4 thinFilmSubstrateK_absorption_pad;
+    vec4 dispersion_thinFilmThickness_thinFilmIor_thinFilmIorK;
+    vec4 thinFilmSubstrateEta_thinFilmSubstrateK_absorption_pad;
 };
 
 struct EmissiveTriangle {
@@ -151,7 +151,7 @@ float rgb_to_reflectance_spectrum(float lambda, vec3 rgb) {
 
 float sigmaAFromMaterial(float lambda, Material mat) {
     float tint = clamp(rgb_to_reflectance_spectrum(lambda, mat.albedo_smoothness.rgb), 1e-4, 0.9999);
-    float strength = max(mat.thinFilmSubstrateK_absorption_pad.y, 0.0);
+    float strength = max(mat.thinFilmSubstrateEta_thinFilmSubstrateK_absorption_pad.z, 0.0);
     return -log(tint) * strength;
 }
 
@@ -456,7 +456,7 @@ void main() {
         float transmission = mat.metallic_smoothShading_transmission_ior.z;
         float smoothness   = mat.albedo_smoothness.w;
         float iorD         = mat.metallic_smoothShading_transmission_ior.w;
-        float dispersion   = mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x;
+        float dispersion   = mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmIorK.x;
 
         if (bounce > 0u && transmission <= 0.001) {
             vec3 wi = -rd;
