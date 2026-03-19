@@ -1,2 +1,5 @@
-﻿  main.cpp
+﻿  bvh.cpp
+  main.cpp
+  Generating Code...
+LINK : warning LNK4098: defaultlib 'MSVCRT' conflicts with use of other libs; use /NODEFAULTLIB:library
   Spectral Pathtracing.vcxproj -> C:\Users\tromn\source\repos\Spectral Pathtracing\x64\Debug\Spectral Pathtracing.exe

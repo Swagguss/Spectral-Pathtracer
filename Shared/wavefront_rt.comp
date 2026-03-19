@@ -10,38 +10,12 @@ const float EPS = 1e-4;
 const float INF_T = 1e30;
 const float MEDIUM_EPS = 1e-4;
 
-const float MNEE_EPS_UV = 2e-3;
-const float MNEE_EPS_C  = 5e-4;
-const float MNEE_SPEC_SMOOTH = 0.985;
-const float EPS_RAY = 5e-5;
-
-const float MNEE_MAX_INITIAL_ERR_2 = 0.15;
-const float MNEE_MAX_INITIAL_ERR_1 = 0.10;
-const float MNEE_MAX_INITIAL_ERR_3 = 0.20;
-
 const float GLASS_MIN_TRANSMIT = 0.02;
-const float GLASS_ABSORB_SCALE = 2.0;
 const float MIN_T = 1e-3;
-
-const uint EVT_REFRACT = 0u;
-const uint EVT_REFLECT = 1u;
 
 const float LAMBDA_MIN = 400.0;
 const float LAMBDA_MAX = 700.0;
 const float XYZ_NORMALIZE = 0.00936;
-
-struct MneeSeed {
-    uint count;
-    uint tri[3];
-    vec2 uv[3];
-    uint evt[3];
-};
-
-struct MneeSolve {
-    bool ok;
-    float invAbsDetJ;
-    MneeSeed seed;
-};
 
 struct GpuPathState {
     vec4 ro;
@@ -74,13 +48,7 @@ struct Material {
     vec4 emissive_emissiveIntensity;                    // xyz = emissiveColor, w = emissiveIntensity
     vec4 metallic_smoothShading_transmission_ior;       // x = metallic, y = smoothShading, z = transmission, w = ior
     vec4 dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta;
-    vec4 thinFilmSubstrateK_pad;
-};
-
-struct TriVerts {
-    vec3 p0;
-    vec3 p1;
-    vec3 p2;
+    vec4 thinFilmSubstrateK_absorption_pad;
 };
 
 struct EmissiveTriangle {
@@ -91,12 +59,6 @@ struct EmissiveTriangle {
 struct TransmissiveTriangle {
     uvec4 triIndex_pad;
     vec4 area_pmf_cdf_pad; // x=area, y=weight/pdf-mass, z=cdf
-};
-
-struct CausticPhoton {
-    vec4 pos_radius;   // xyz = receiver hit position, w = radius
-    vec4 wi_lambda;    // xyz = incoming direction at receiver, w = lambda
-    vec4 power_pad;    // x = scalar flux
 };
 
 layout(std140, binding = 0) uniform FrameParams {
@@ -421,6 +383,13 @@ vec3 samplePhaseHG(vec3 wo, float g, vec2 u, out float pdf) {
 float sampleFreeFlight(float sigmaT, inout uint rng) {
     float u = max(1e-8, 1.0 - rand01(rng));
     return -log(u) / max(sigmaT, 1e-8);
+}
+
+float materialAbsorptionSigma(uint prim, float lambda) {
+    Material mat = materials[triangleMaterialIndices[prim]];
+    float tint = clamp(rgb_to_reflectance_spectrum(lambda, mat.albedo_smoothness.xyz), MIN_T, 0.9999);
+    float strength = max(mat.thinFilmSubstrateK_absorption_pad.y, 0.0);
+    return -log(tint) * strength;
 }
 
 float transmittanceHomogeneous(float sigmaT, float dist) {
@@ -929,6 +898,204 @@ float fresnelDielectric(float cosThetaI, float etaI, float etaT) {
     return 0.5 * (rParl * rParl + rPerp * rPerp);
 }
 
+vec2 c_make(float re, float im) {
+    return vec2(re, im);
+}
+
+vec2 c_conj(vec2 z) {
+    return vec2(z.x, -z.y);
+}
+
+vec2 c_add(vec2 a, vec2 b) {
+    return a + b;
+}
+
+vec2 c_sub(vec2 a, vec2 b) {
+    return a - b;
+}
+
+vec2 c_mul(vec2 a, vec2 b) {
+    return vec2(
+        a.x * b.x - a.y * b.y,
+        a.x * b.y + a.y * b.x
+    );
+}
+
+vec2 c_scale(vec2 a, float s) {
+    return a * s;
+}
+
+vec2 c_div(vec2 a, vec2 b) {
+    float d = dot(b, b);
+    if (d <= 1e-20) return vec2(0.0);
+    return vec2(
+        (a.x * b.x + a.y * b.y) / d,
+        (a.y * b.x - a.x * b.y) / d
+    );
+}
+
+float c_abs2(vec2 z) {
+    return dot(z, z);
+}
+
+vec2 c_sqrt(vec2 z) {
+    float r = length(z);
+    float t = sqrt(max(0.0, 0.5 * (r + z.x)));
+    float u = sqrt(max(0.0, 0.5 * (r - z.x)));
+    float im = (z.y < 0.0) ? -u : u;
+    vec2 outZ = vec2(t, im);
+
+    // Pick the physically sensible branch more consistently.
+    if (outZ.x < 0.0) outZ = -outZ;
+    if (abs(outZ.x) < 1e-8 && outZ.y < 0.0) outZ = -outZ;
+    return outZ;
+}
+
+vec2 c_exp_i(float phi) {
+    return vec2(cos(phi), sin(phi));
+}
+
+vec2 complexCosThetaT(vec2 nI, vec2 nT, float sin2ThetaI) {
+    vec2 ratio = c_div(nI, nT);
+    vec2 ratio2 = c_mul(ratio, ratio);
+    vec2 arg = c_sub(vec2(1.0, 0.0), c_scale(ratio2, sin2ThetaI));
+    return c_sqrt(arg);
+}
+
+vec2 fresnelAmplitude_s(vec2 nI, vec2 nT, vec2 cosI, vec2 cosT) {
+    vec2 num = c_sub(c_mul(nI, cosI), c_mul(nT, cosT));
+    vec2 den = c_add(c_mul(nI, cosI), c_mul(nT, cosT));
+    return c_div(num, den);
+}
+
+vec2 fresnelAmplitude_p(vec2 nI, vec2 nT, vec2 cosI, vec2 cosT) {
+    vec2 num = c_sub(c_mul(nT, cosI), c_mul(nI, cosT));
+    vec2 den = c_add(c_mul(nT, cosI), c_mul(nI, cosT));
+    return c_div(num, den);
+}
+
+float thinFilmReflectanceOpaque(Material mat, float lambdaNm, float cosThetaI) {
+    float thicknessNm = max(mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.y, 0.0);
+    float filmIor     = max(mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.z, 1.0);
+    float subEta      = max(mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.w, 1e-4);
+    float subK        = max(mat.thinFilmSubstrateK_absorption_pad.x, 0.0);
+
+    cosThetaI = clamp(cosThetaI, 0.0, 1.0);
+
+    vec2 n0 = vec2(1.0, 0.0);
+    vec2 n1 = vec2(filmIor, 0.0);
+    vec2 n2 = vec2(subEta, subK);
+
+    float sin2ThetaI = max(0.0, 1.0 - cosThetaI * cosThetaI);
+
+    vec2 cos0 = vec2(cosThetaI, 0.0);
+    vec2 cos1 = complexCosThetaT(n0, n1, sin2ThetaI);
+    vec2 cos2 = complexCosThetaT(n0, n2, sin2ThetaI);
+
+    vec2 r01s = fresnelAmplitude_s(n0, n1, cos0, cos1);
+    vec2 r01p = fresnelAmplitude_p(n0, n1, cos0, cos1);
+
+    vec2 r12s = fresnelAmplitude_s(n1, n2, cos1, cos2);
+    vec2 r12p = fresnelAmplitude_p(n1, n2, cos1, cos2);
+
+    // Film phase: beta = 2*pi/lambda * n1 * d * cos(theta1)
+    // Since n1 is real here, beta is real.
+    float beta = (2.0 * PI * filmIor * thicknessNm * cos1.x) / max(lambdaNm, 1e-6);
+    vec2 e2ib = c_exp_i(2.0 * beta);
+
+    vec2 rs_num = c_add(r01s, c_mul(r12s, e2ib));
+    vec2 rs_den = c_add(vec2(1.0, 0.0), c_mul(c_mul(r01s, r12s), e2ib));
+    vec2 rp_num = c_add(r01p, c_mul(r12p, e2ib));
+    vec2 rp_den = c_add(vec2(1.0, 0.0), c_mul(c_mul(r01p, r12p), e2ib));
+
+    vec2 rs = c_div(rs_num, rs_den);
+    vec2 rp = c_div(rp_num, rp_den);
+
+    float Rs = c_abs2(rs);
+    float Rp = c_abs2(rp);
+
+    return clamp(0.5 * (Rs + Rp), 0.0, 1.0);
+}
+
+float fresnelConductor(float cosThetaI, float eta, float k) {
+    cosThetaI = clamp(cosThetaI, 0.0, 1.0);
+
+    float cos2 = cosThetaI * cosThetaI;
+    float sin2 = max(1.0 - cos2, 0.0);
+
+    float eta2 = eta * eta;
+    float k2   = k * k;
+
+    float t0 = eta2 - k2 - sin2;
+    float a2pb2 = sqrt(max(t0 * t0 + 4.0 * eta2 * k2, 0.0));
+    float a = sqrt(max(0.5 * (a2pb2 + t0), 0.0));
+
+    float t1 = a2pb2 + cos2;
+    float t2 = 2.0 * a * cosThetaI;
+    float Rs = (t1 - t2) / max(t1 + t2, 1e-8);
+
+    float t3 = cos2 * a2pb2 + sin2 * sin2;
+    float t4 = t2 * sin2;
+    float Rp = Rs * (t3 - t4) / max(t3 + t4, 1e-8);
+
+    return clamp(0.5 * (Rs + Rp), 0.0, 1.0);
+}
+
+float thinFilmReflectance(
+    float cosTheta,
+    float lambdaNm,
+    float baseF,
+    Material mat
+) {
+    float thicknessNm = max(mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.y, 0.0);
+    float nFilm       = max(mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.z, 1.0);
+    float etaSub      = max(mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.w, 1e-4);
+    float kSub        = max(mat.thinFilmSubstrateK_absorption_pad.x, 0.0);
+
+    if (thicknessNm <= 0.0 || nFilm <= 1.0001) {
+        return clamp(baseF, 0.0, 1.0);
+    }
+
+    cosTheta = clamp(cosTheta, 0.0, 1.0);
+
+    // Air -> film Snell
+    float sin2Theta = max(1.0 - cosTheta * cosTheta, 0.0);
+    float sin2Film = sin2Theta / max(nFilm * nFilm, 1e-8);
+
+    if (sin2Film >= 1.0) {
+        return 1.0;
+    }
+
+    float cosThetaFilm = sqrt(max(1.0 - sin2Film, 0.0));
+
+    float R01 = fresnelDielectric(cosTheta, 1.0, nFilm);
+
+    float etaRel = etaSub / nFilm;
+    float kRel   = kSub / nFilm;
+    float R12 = fresnelConductor(cosThetaFilm, etaRel, kRel);
+
+    float phase = 4.0 * PI * nFilm * thicknessNm * cosThetaFilm / max(lambdaNm, 1e-3);
+    float c = cos(phase);
+
+    // Scalar Airy-style interference.
+    float sqrtTerm = sqrt(max(R01 * R12, 0.0));
+    float num = R01 + R12 + 2.0 * sqrtTerm * c;
+    float den = 1.0 + R01 * R12 + 2.0 * sqrtTerm * c;
+
+    return clamp(num / max(den, 1e-6), 0.0, 1.0);
+}
+
+float opaqueSpecularSamplingWeight(
+    float albedoS,
+    float metallic,
+    float lambda,
+    Material mat
+) {
+    float baseF0 = mix(0.04, albedoS, metallic);
+    float coatedF0 = thinFilmReflectance(1.0, lambda, baseF0, mat);
+    return clamp(coatedF0, 0.05, 0.95);
+}
+
 bool refractDir(vec3 I, vec3 N, float eta, out vec3 T) {
     // I points in ray direction (away from origin)
     float cosNI = dot(N, I);
@@ -945,12 +1112,13 @@ float bsdfPdf(
     vec3 N,
     vec3 V,
     vec3 L,
-    vec3 albedo,
+    float albedoS,
     float smoothness,
-    float metallic
+    float metallic,
+    float lambda,
+    Material mat
 ) {
-    vec3 F0 = mix(vec3(0.04), albedo, metallic);
-    float specW = specularSamplingWeight(F0);
+    float specW = opaqueSpecularSamplingWeight(albedoS, metallic, lambda, mat);
     float diffW = 1.0 - specW;
 
     float pdfD = pdfDiffuse(N, L);
@@ -962,15 +1130,16 @@ float bsdfPdf(
 vec3 sampleBSDF(
     vec3 N,
     vec3 V,
-    vec3 albedo,
+    float albedoS,
     float smoothness,
     float metallic,
+    float lambda,
+    Material mat,
     vec2 uSelect,
     vec2 uDir,
     out float outPdf
 ) {
-    vec3 F0 = mix(vec3(0.04), albedo, metallic);
-    float specW = specularSamplingWeight(F0);
+    float specW = opaqueSpecularSamplingWeight(albedoS, metallic, lambda, mat);
     float diffW = 1.0 - specW;
 
     vec3 L;
@@ -980,7 +1149,7 @@ vec3 sampleBSDF(
         L = sampleGGX(N, V, smoothness, uDir);
     }
 
-    outPdf = bsdfPdf(N, V, L, albedo, smoothness, metallic);
+    outPdf = bsdfPdf(N, V, L, albedoS, smoothness, metallic, lambda, mat);
     return L;
 }
 
@@ -991,7 +1160,6 @@ float evalDielectricMicrofacet(
     float roughness,
     float etaI,
     float etaT,
-    float transColor,
     out bool isTransmission
 ) {
     float NoV = dot(N, V);
@@ -1042,7 +1210,7 @@ float evalDielectricMicrofacet(
         float factor = (VoH * LoH) /
             max(abs(NoV) * abs(NoL) * denom * denom, 1e-8);
 
-        return transColor * ((1.0 - F) * D * G * factor);
+        return ((1.0 - F) * D * G * factor);
     }
 }
 
@@ -1153,7 +1321,7 @@ DielectricSample sampleDielectricBSDF(
             float absNoL = max(abs(dot(N, L)), 1e-8);
 
             s.dir = normalize(L);
-            s.f = albedoS * ((1.0 - Fr) / absNoL);
+            s.f = (1.0 - Fr) / absNoL;
             s.pdf = max(1.0 - Fr, 1e-8);
             s.isTransmission = 1u;
             s.isDelta = 1u;
@@ -1171,7 +1339,7 @@ DielectricSample sampleDielectricBSDF(
         }
 
         bool isTransmission = false;
-        float f = evalDielectricMicrofacet(N, V, L, roughness, etaI, etaT, albedoS, isTransmission);
+        float f = evalDielectricMicrofacet(N, V, L, roughness, etaI, etaT, isTransmission);
         float pdf = pdfDielectricMicrofacet(N, V, L, roughness, etaI, etaT);
 
         if (isTransmission || f <= 1e-8 || pdf <= 1e-8) {
@@ -1197,7 +1365,7 @@ DielectricSample sampleDielectricBSDF(
         }
 
         bool isTransmission = false;
-        float f = evalDielectricMicrofacet(N, V, L, roughness, etaI, etaT, albedoS, isTransmission);
+        float f = evalDielectricMicrofacet(N, V, L, roughness, etaI, etaT, isTransmission);
         float pdf = pdfDielectricMicrofacet(N, V, L, roughness, etaI, etaT);
 
         if (!isTransmission || f <= 1e-8 || pdf <= 1e-8) {
@@ -1219,7 +1387,9 @@ float evalBSDFScalar(
     vec3 L,
     float albedoS,
     float smoothness,
-    float metallic
+    float metallic,
+    Material mat,
+    float lambda
 ) {
     float NoV = saturate(dot(N, V));
     float NoL = saturate(dot(N, L));
@@ -1232,8 +1402,1465 @@ float evalBSDFScalar(
     float roughness = roughnessFromSmoothness(smoothness);
     float alpha = roughness * roughness;
 
-    float F0 = mix(0.04, albedoS, metallic);
-    float F = fresnelSchlickScalar(VoH, F0);
+    float transmission = mat.metallic_smoothShading_transmission_ior.z;
+    float filmThickness = mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.y;
+
+    float F;
+    if (transmission <= 0.001 && filmThickness > 0.0) {
+        F = thinFilmReflectanceOpaque(mat, lambda, VoH);
+    } else {
+        float F0 = mix(0.04, albedoS, metallic);
+        F = fresnelSchlickScalar(VoH, F0);
+    }
+
+    float D = D_GGX(NoH, alpha);
+    float G = G_SmithGGX(NoV, NoL, alpha);
+
+    float spec = (D * G * F) / max(4.0 * NoV * NoL, 1e-8);
+    float kd = (1.0 - F) * (1.0 - metallic);
+    float diff = kd * albedoS / PI;
+
+    return diff + spec;
+}#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float RGB_CLAMP = 1.0;
+const float PI = 3.14159265358979323846;
+const float EPS = 1e-4;
+const float INF_T = 1e30;
+const float MEDIUM_EPS = 1e-4;
+
+const float MNEE_EPS_UV = 2e-3;
+const float MNEE_EPS_C  = 5e-4;
+const float MNEE_SPEC_SMOOTH = 0.985;
+const float EPS_RAY = 5e-5;
+
+const float MNEE_MAX_INITIAL_ERR_2 = 0.15;
+const float MNEE_MAX_INITIAL_ERR_1 = 0.10;
+const float MNEE_MAX_INITIAL_ERR_3 = 0.20;
+
+const float GLASS_MIN_TRANSMIT = 0.02;
+const float MIN_T = 1e-3;
+
+const uint EVT_REFRACT = 0u;
+const uint EVT_REFLECT = 1u;
+
+const float LAMBDA_MIN = 400.0;
+const float LAMBDA_MAX = 700.0;
+const float XYZ_NORMALIZE = 0.00936;
+
+struct MneeSeed {
+    uint count;
+    uint tri[3];
+    vec2 uv[3];
+    uint evt[3];
+};
+
+struct MneeSolve {
+    bool ok;
+    float invAbsDetJ;
+    MneeSeed seed;
+};
+
+struct GpuPathState {
+    vec4 ro;
+    vec4 rd;
+
+    // x = scalar spectral throughput
+    // y = sampled wavelength in nm
+    // z,w unused
+    vec4 throughput_lambda;
+
+    // xyz = accumulated XYZ radiance for this path
+    vec4 radianceXYZ;
+
+    uint pixelIndex;
+    uint alive;
+    uint bounce;
+    uint pad0;
+};
+
+struct DielectricSample {
+    vec3 dir;
+    float f;
+    float pdf;
+    uint isTransmission;
+    uint isDelta;
+};
+
+struct Material {
+    vec4 albedo_smoothness;                              // xyz = albedo, w = smoothness
+    vec4 emissive_emissiveIntensity;                    // xyz = emissiveColor, w = emissiveIntensity
+    vec4 metallic_smoothShading_transmission_ior;       // x = metallic, y = smoothShading, z = transmission, w = ior
+    vec4 dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta;
+    vec4 thinFilmSubstrateK_absorption_pad;
+};
+
+struct EmissiveTriangle {
+    uvec4 triIndex_pad;         // x = triIndex
+    vec4 area_pmf_cdf_pad;      // x = area, y = pmf, z = cdf
+};
+
+struct TransmissiveTriangle {
+    uvec4 triIndex_pad;
+    vec4 area_pmf_cdf_pad; // x=area, y=weight/pdf-mass, z=cdf
+};
+
+layout(std140, binding = 0) uniform FrameParams {
+    uvec4 screen;
+    uvec4 extra;
+
+    vec4 camPos;
+    vec4 camForward;
+    vec4 camRight;
+    vec4 camUp;
+    vec4 camData;
+
+    vec4 sunDirIntensity;
+    vec4 sunColor;
+    vec4 fogParams;
+
+    vec4 misc;
+    vec4 misc2;
+    uvec4 causticState;
+
+    uvec4 transmissiveTriangleCount;
+
+    vec4 whiteBalance;
+
+    uint photonHitCapacity;
+    uint photonPad0;
+    uint photonPad1;
+    uint photonPad2;
+} frame;
+
+layout(std430, binding = 1) buffer PathBuffer {
+    GpuPathState paths[];
+};
+
+layout(binding = 2, rgba32f) uniform writeonly image2D outImage;
+layout(binding = 3, rgba32f) uniform coherent image2D accumImage;
+layout(binding = 4) uniform accelerationStructureEXT sceneTLAS;
+
+layout(std430, binding = 5) readonly buffer VertexBuffer {
+    float vertexData[];
+};
+
+layout(std430, binding = 6) readonly buffer IndexBuffer {
+    uint indexData[];
+};
+
+layout(std430, binding = 7) readonly buffer TriangleMaterialBuffer {
+    uint triangleMaterialIndices[];
+};
+
+layout(std430, binding = 8) readonly buffer MaterialBuffer {
+    Material materials[];
+};
+
+layout(std430, binding = 9) readonly buffer EmissiveTriBuffer {
+    EmissiveTriangle emissiveTriangles[];
+};
+
+layout(std430, binding = 10) readonly buffer NormalBuffer {
+    float normalData[];
+};
+
+// Output textures for denoiser
+layout(binding = 11, rgba32f) uniform writeonly image2D albedoImage;
+layout(binding = 12, rgba32f) uniform writeonly image2D normalImage;
+layout(binding = 13, rgba32f) uniform writeonly image2D depthImage;
+
+//layout(std430, binding = 14) buffer PhotonGridCountBuffer {
+//    uint photonGridCounts[];
+//};
+//
+//layout(std430, binding = 15) buffer PhotonGridPhotonBuffer {
+//    CausticPhoton photonGridPhotons[];
+//};
+//
+layout(std430, binding = 16) readonly buffer TransmissiveTriBuffer {
+    TransmissiveTriangle transmissiveTriangles[];
+};
+
+layout(binding = 17, rgba32f) uniform readonly image2D causticsImage;
+
+vec3 sampleCausticsImageXYZ(ivec2 pix) {
+    return max(imageLoad(causticsImage, pix).xyz, vec3(0.0));
+}
+
+uint sampleTransmissiveTriangle(float xi, uint count) {
+    if (count == 0u) {
+        return 0u;
+    }
+
+    xi = min(max(xi, 0.0), 0.99999994);
+
+    uint lo = 0u;
+    uint hi = count;
+
+    while (lo < hi) {
+        uint mid = lo + ((hi - lo) >> 1u);
+        float cdf = transmissiveTriangles[mid].area_pmf_cdf_pad.z;
+
+        if (xi <= cdf) {
+            hi = mid;
+        } else {
+            lo = mid + 1u;
+        }
+    }
+
+    return min(lo, count - 1u);
+}
+
+vec3 loadNormal(uint vertexIndex) {
+    uint base = vertexIndex * 3u;
+    return vec3(
+        normalData[base + 0u],
+        normalData[base + 1u],
+        normalData[base + 2u]
+    );
+}
+
+uint hash_u32(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+float rand01(inout uint state) {
+    state = hash_u32(state);
+    return float(state) * (1.0 / 4294967296.0);
+}
+
+vec3 clamp_rgb_luma(vec3 color, float maxLuma) {
+    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    if (luma <= maxLuma || luma <= 1e-8) {
+        return color;
+    }
+    return color * (maxLuma / luma);
+}
+
+float gauss1(float x, float mu, float sigma) {
+    float t = (x - mu) / sigma;
+    return exp(-0.5 * t * t);
+}
+
+float rgb_to_spectrum_unit(float lambda, vec3 rgb) {
+    float Sr = exp(-((lambda - 610.0) / 35.0) * ((lambda - 610.0) / 35.0));
+    float Sg = exp(-((lambda - 540.0) / 30.0) * ((lambda - 540.0) / 30.0));
+    float Sb = exp(-((lambda - 460.0) / 20.0) * ((lambda - 460.0) / 20.0));
+
+    float denom = max(Sr + Sg + Sb, 1e-6);
+    vec3 c = max(rgb, vec3(0.0));
+    return (c.r * Sr + c.g * Sg + c.b * Sb) / denom;
+}
+
+float rgb_to_reflectance_spectrum(float lambda, vec3 rgb) {
+    vec3 c = clamp(rgb, vec3(0.0), vec3(1.0));
+    float m = max(c.r, max(c.g, c.b));
+    if (m <= 0.0) return 0.0;
+
+    vec3 chroma = c / m;
+    float s = rgb_to_spectrum_unit(lambda, chroma);
+    return clamp(m * s, 0.0, 0.999);
+}
+
+float rgb_to_emission_spectrum(float lambda, vec3 rgb) {
+    vec3 c = max(rgb, vec3(0.0));
+    float m = max(c.r, max(c.g, c.b));
+    if (m <= 0.0) return 0.0;
+
+    vec3 chroma = c / m;
+    float s = rgb_to_spectrum_unit(lambda, chroma);
+    return m * s;
+}
+
+vec3 cie_xyz_bar(float lambda) {
+    float x =
+        1.056 * gauss1(lambda, 599.8, 37.9) +
+        0.362 * gauss1(lambda, 442.0, 16.0) -
+        0.065 * gauss1(lambda, 501.1, 20.4);
+
+    float y =
+        0.821 * gauss1(lambda, 568.8, 23.4) +
+        0.286 * gauss1(lambda, 530.9, 32.3);
+
+    float z =
+        1.217 * gauss1(lambda, 437.0, 11.8) +
+        0.681 * gauss1(lambda, 459.0, 26.0);
+
+    return max(vec3(x, y, z), vec3(0.0)) * XYZ_NORMALIZE;
+}
+
+vec3 xyz_to_linear_srgb(vec3 xyz) {
+    float r =  3.2406 * xyz.x - 1.5372 * xyz.y - 0.4986 * xyz.z;
+    float g = -0.9689 * xyz.x + 1.8758 * xyz.y + 0.0415 * xyz.z;
+    float b =  0.0557 * xyz.x - 0.2040 * xyz.y + 1.0570 * xyz.z;
+    return vec3(r, g, b);
+}
+
+vec3 linear_srgb_to_xyz(vec3 rgb) {
+    float x = 0.4124 * rgb.r + 0.3576 * rgb.g + 0.1805 * rgb.b;
+    float y = 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
+    float z = 0.0193 * rgb.r + 0.1192 * rgb.g + 0.9505 * rgb.b;
+    return vec3(x, y, z);
+}
+
+vec3 orthonormalT(vec3 N) {
+    return normalize(abs(N.z) < 0.999
+        ? cross(N, vec3(0.0, 0.0, 1.0))
+        : cross(N, vec3(0.0, 1.0, 0.0)));
+}
+
+bool pointToTriangleBary(
+    vec3 p, vec3 a, vec3 b, vec3 c,
+    out vec3 bc
+) {
+    vec3 v0 = b - a;
+    vec3 v1 = c - a;
+    vec3 v2 = p - a;
+
+    float d00 = dot(v0, v0);
+    float d01 = dot(v0, v1);
+    float d11 = dot(v1, v1);
+    float d20 = dot(v2, v0);
+    float d21 = dot(v2, v1);
+
+    float denom = d00 * d11 - d01 * d01;
+    if (abs(denom) < 1e-12) {
+        bc = vec3(1.0, 0.0, 0.0);
+        return false;
+    }
+
+    float v = (d11 * d20 - d01 * d21) / denom;
+    float w = (d00 * d21 - d01 * d20) / denom;
+    float u = 1.0 - v - w;
+
+    bc = vec3(u, v, w);
+    return true;
+}
+
+vec3 baryToPoint(vec3 bc, vec3 a, vec3 b, vec3 c) {
+    return bc.x * a + bc.y * b + bc.z * c;
+}
+
+float randn(inout uint rng) {
+    float u1 = max(rand01(rng), 1e-8);
+    float u2 = rand01(rng);
+    return sqrt(-2.0 * log(u1)) * cos(2.0 * PI * u2);
+}
+
+bool sampleTriangleGuidedBary(
+    vec3 bcCenter,
+    float sigma,
+    inout uint rng,
+    out vec3 bc,
+    out float pdfLocal
+) {
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        float dv = randn(rng) * sigma;
+        float dw = randn(rng) * sigma;
+
+        float v = bcCenter.y + dv;
+        float w = bcCenter.z + dw;
+        float u = 1.0 - v - w;
+
+        if (u >= 0.0 && v >= 0.0 && w >= 0.0) {
+            bc = vec3(u, v, w);
+
+            float g = exp(-0.5 * (dv * dv + dw * dw) / max(sigma * sigma, 1e-8));
+            pdfLocal = g / max(2.0 * PI * sigma * sigma, 1e-8);
+            return true;
+        }
+    }
+
+    bc = bcCenter;
+    pdfLocal = 1.0 / max(2.0 * PI * sigma * sigma, 1e-8);
+    return all(greaterThanEqual(bcCenter, vec3(0.0)));
+}
+
+void makeBasis(vec3 N, out vec3 T, out vec3 B) {
+    T = orthonormalT(N);
+    B = cross(T, N);
+}
+
+float phaseHG(float cosTheta, float g) {
+    float g2 = g * g;
+    float denom = 1.0 + g2 - 2.0 * g * cosTheta;
+    return (1.0 - g2) / max(4.0 * PI * denom * sqrt(denom), 1e-8);
+}
+
+float phaseHGPdf(float cosTheta, float g) {
+    return phaseHG(cosTheta, g);
+}
+
+vec3 samplePhaseHG(vec3 wo, float g, vec2 u, out float pdf) {
+    float cosTheta;
+    if (abs(g) < 1e-3) {
+        cosTheta = 1.0 - 2.0 * u.x;
+    } else {
+        float sqr = (1.0 - g * g) / (1.0 - g + 2.0 * g * u.x);
+        cosTheta = (1.0 + g * g - sqr * sqr) / (2.0 * g);
+        cosTheta = clamp(cosTheta, -1.0, 1.0);
+    }
+
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    float phi = 2.0 * PI * u.y;
+
+    vec3 w = normalize(-wo);
+    vec3 T, B;
+    makeBasis(w, T, B);
+
+    vec3 wi = normalize(
+        T * (cos(phi) * sinTheta) +
+        B * (sin(phi) * sinTheta) +
+        w * cosTheta
+    );
+
+    pdf = phaseHGPdf(dot(w, wi), g);
+    return wi;
+}
+
+float sampleFreeFlight(float sigmaT, inout uint rng) {
+    float u = max(1e-8, 1.0 - rand01(rng));
+    return -log(u) / max(sigmaT, 1e-8);
+}
+
+float materialAbsorptionSigma(uint prim, float lambda) {
+    Material mat = materials[triangleMaterialIndices[prim]];
+    float tint = clamp(rgb_to_reflectance_spectrum(lambda, mat.albedo_smoothness.xyz), MIN_T, 0.9999);
+    float strength = max(mat.thinFilmSubstrateK_absorption_pad.y, 0.0);
+    return -log(tint) * strength;
+}
+
+float transmittanceHomogeneous(float sigmaT, float dist) {
+    return exp(-sigmaT * max(dist, 0.0));
+}
+
+bool traceAnyHit(
+    vec3 ro,
+    vec3 rd,
+    float tMax
+) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq,
+        sceneTLAS,
+        gl_RayFlagsOpaqueEXT,
+        0xFF,
+        ro,
+        EPS,
+        rd,
+        tMax
+    );
+
+    while (rayQueryProceedEXT(rq)) {
+    }
+
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+float iorAtLambda(float iorD, float dispersionStrength, float lambdaNm) {
+    float lambda = lambdaNm * 1e-3; // um
+    float V = mix(80.0, 10.0, clamp(dispersionStrength, 0.0, 1.0));
+
+    float lambdaD = 0.5876;
+    float lambdaF = 0.4861;
+    float lambdaC = 0.6563;
+
+    float dN = (iorD - 1.0) / V;
+    float denom = (1.0 / (lambdaF * lambdaF)) - (1.0 / (lambdaC * lambdaC));
+    float B = dN / denom;
+    float A = iorD - B / (lambdaD * lambdaD);
+
+    return A + B / (lambda * lambda);
+}
+
+float materialIorAtLambda(uint triIndex, float lambda) {
+    Material mat = materials[triangleMaterialIndices[triIndex]];
+    return iorAtLambda(mat.metallic_smoothShading_transmission_ior.w, mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x, lambda);
+}
+
+vec3 loadVertex(uint vertexIndex) {
+    uint base = vertexIndex * 3u;
+    return vec3(
+        vertexData[base + 0u],
+        vertexData[base + 1u],
+        vertexData[base + 2u]
+    );
+}
+
+void loadTriangle(uint triIndex, out vec3 v0, out vec3 v1, out vec3 v2) {
+    uint i0 = indexData[triIndex * 3u + 0u];
+    uint i1 = indexData[triIndex * 3u + 1u];
+    uint i2 = indexData[triIndex * 3u + 2u];
+    v0 = loadVertex(i0);
+    v1 = loadVertex(i1);
+    v2 = loadVertex(i2);
+}
+
+vec3 triangleNormal(vec3 v0, vec3 v1, vec3 v2) {
+    return normalize(cross(v1 - v0, v2 - v0));
+}
+
+vec2 sampleUniformTriangle(vec2 u) {
+    float su0 = sqrt(u.x);
+    return vec2(1.0 - su0, u.y * su0);
+}
+
+uint sampleEmissiveTriangle(float xi) {
+    uint count = frame.extra.x;
+    for (uint i = 0u; i < count; ++i) {
+        if (xi <= emissiveTriangles[i].area_pmf_cdf_pad.z) {
+            return i;
+        }
+    }
+    return count - 1u;
+}
+
+bool traceClosest(
+    vec3 ro,
+    vec3 rd,
+    out uint outPrim,
+    out float outTHit,
+    out vec2 outBary
+) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq,
+        sceneTLAS,
+        gl_RayFlagsOpaqueEXT,
+        0xFF,
+        ro,
+        EPS,
+        rd,
+        INF_T
+    );
+
+    while (rayQueryProceedEXT(rq)) {
+    }
+
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        return false;
+    }
+
+    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+
+    outPrim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+    outTHit = rayQueryGetIntersectionTEXT(rq, true);
+    outBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+    return true;
+}
+
+bool traceShadow(
+    vec3 ro,
+    vec3 rd,
+    float tMax,
+    uint lightTriIndex
+) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq,
+        sceneTLAS,
+        gl_RayFlagsOpaqueEXT,
+        0xFF,
+        ro,
+        EPS,
+        rd,
+        tMax
+    );
+
+    while (rayQueryProceedEXT(rq)) {
+    }
+
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        return false;
+    }
+
+    uint hitPrim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+    float hitT   = rayQueryGetIntersectionTEXT(rq, true);
+
+    // If the first hit is the sampled light itself, treat it as visible.
+    if (hitPrim == lightTriIndex && hitT <= tMax + 1e-3) {
+        return false;
+    }
+
+    return true;
+}
+
+float saturate(float x) {
+    return clamp(x, 0.0, 1.0);
+}
+
+float luminance(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+float roughnessFromSmoothness(float smoothness) {
+    return max(0.02, 1.0 - clamp(smoothness, 0.0, 1.0));
+}
+
+float alphaFromSmoothness(float smoothness) {
+    float r = roughnessFromSmoothness(smoothness);
+    return max(0.001, r * r);
+}
+
+bool isDeltaSpecular(float smoothness) {
+    return smoothness > 0.98;
+}
+
+bool isOpaqueDeltaSpecular(float transmission, float metallic, float smoothness) {
+    return transmission <= 0.001 && metallic > 0.999 && smoothness > 0.98;
+}
+
+float fresnelSchlickScalar(float cosTheta, float F0) {
+    float m = 1.0 - saturate(cosTheta);
+    float m2 = m * m;
+    float m5 = m2 * m2 * m;
+    return F0 + (1.0 - F0) * m5;
+}
+
+float D_GGX(float NoH, float alpha) {
+    float alpha2 = alpha * alpha;
+    float denom = NoH * NoH * (alpha2 - 1.0) + 1.0;
+    return alpha2 / max(PI * denom * denom, 1e-8);
+}
+
+float G1_SmithGGX(float NoV, float alpha) {
+    float a2 = alpha * alpha;
+    float denom = NoV + sqrt(a2 + (1.0 - a2) * NoV * NoV);
+    return (2.0 * NoV) / max(denom, 1e-8);
+}
+
+float G_SmithGGX(float NoV, float NoL, float alpha) {
+    return G1_SmithGGX(NoV, alpha) * G1_SmithGGX(NoL, alpha);
+}
+
+vec3 sampleCosineHemisphere(vec3 N, vec2 u) {
+    float phi = 2.0 * PI * u.x;
+    float r = sqrt(u.y);
+    float x = r * cos(phi);
+    float y = r * sin(phi);
+    float z = sqrt(max(0.0, 1.0 - u.y));
+
+    vec3 T = normalize(abs(N.z) < 0.999 ? cross(N, vec3(0.0, 0.0, 1.0))
+                                        : cross(N, vec3(0.0, 1.0, 0.0)));
+    vec3 B = cross(T, N);
+
+    return normalize(T * x + B * y + N * z);
+}
+
+float mediumSunDirect(
+    vec3 x,
+    vec3 wo,
+    float lambda,
+    float sigmaT,
+    float g
+) {
+    if (frame.extra.y == 0u) return 0.0;
+
+    vec3 sunDir = normalize(frame.sunDirIntensity.xyz);
+    vec3 L = sunDir;
+
+    float phaseVal = phaseHG(dot(wo, L), g);
+    float pdfPhase = phaseHGPdf(dot(wo, L), g);
+
+    if (phaseVal <= 0.0 || pdfPhase <= 0.0) return 0.0;
+
+    bool occluded = traceAnyHit(x + L * MEDIUM_EPS, L, INF_T);
+    if (occluded) return 0.0;
+
+    float LeS = rgb_to_emission_spectrum(lambda, frame.sunColor.xyz * frame.sunDirIntensity.w);
+
+    // Delta directional light: only NEE can sample it, so MIS weight = 1.
+    float Tr = 1.0; // no finite distance, no medium extinction to infinity in this simple version
+    return LeS * phaseVal * Tr;
+}
+
+float mediumAreaLightDirect(
+    vec3 x,
+    vec3 wo,
+    float lambda,
+    float sigmaT,
+    float g,
+    inout uint rng
+) {
+    if (frame.extra.x == 0u) return 0.0;
+
+    uint lightSlot = sampleEmissiveTriangle(rand01(rng));
+    uint lightTriIndex = emissiveTriangles[lightSlot].triIndex_pad.x;
+    float lightArea = emissiveTriangles[lightSlot].area_pmf_cdf_pad.x;
+    float lightPmf = emissiveTriangles[lightSlot].area_pmf_cdf_pad.y;
+
+    if (lightArea <= 0.0 || lightPmf <= 0.0) return 0.0;
+
+    vec3 lv0, lv1, lv2;
+    loadTriangle(lightTriIndex, lv0, lv1, lv2);
+
+    vec2 u = vec2(rand01(rng), rand01(rng));
+    vec2 b = sampleUniformTriangle(u);
+    float w0 = 1.0 - b.x - b.y;
+    float w1 = b.x;
+    float w2 = b.y;
+
+    vec3 lightPos = w0 * lv0 + w1 * lv1 + w2 * lv2;
+    vec3 lightN = triangleNormal(lv0, lv1, lv2);
+
+    uint lightMatIndex = triangleMaterialIndices[lightTriIndex];
+    Material lightMat = materials[lightMatIndex];
+    vec3 Le = lightMat.emissive_emissiveIntensity.xyz * lightMat.emissive_emissiveIntensity.w;
+
+    vec3 toLight = lightPos - x;
+    float dist2 = dot(toLight, toLight);
+    if (dist2 <= 1e-12) return 0.0;
+
+    float dist = sqrt(dist2);
+    vec3 L = toLight / dist;
+
+    float cosLight = max(dot(lightN, -L), 0.0);
+    if (cosLight <= 1e-8) return 0.0;
+
+    bool occluded = traceShadow(x + L * MEDIUM_EPS, L, dist, lightTriIndex);
+    if (occluded) return 0.0;
+
+    float Tr = transmittanceHomogeneous(sigmaT, dist);
+
+    float LeS = rgb_to_emission_spectrum(lambda, Le);
+    float phaseVal = phaseHG(dot(wo, L), g);
+    float pdfPhase = phaseHGPdf(dot(wo, L), g);
+
+    float pdfLightArea = lightPmf / lightArea;
+    float pdfLightW = pdfLightArea * dist2 / max(cosLight, 1e-8);
+
+    float wLight = pdfLightW / max(pdfLightW + pdfPhase, 1e-8);
+
+    return LeS * Tr * phaseVal * wLight / max(pdfLightW, 1e-8);
+}
+
+bool getEmissiveTriangleInfo(
+    uint triIndex,
+    out float outArea,
+    out float outPmf
+) {
+    outArea = 0.0;
+    outPmf = 0.0;
+
+    for (uint i = 0u; i < frame.extra.x; ++i) {
+        if (emissiveTriangles[i].triIndex_pad.x == triIndex) {
+            outArea = emissiveTriangles[i].area_pmf_cdf_pad.x;
+            outPmf  = emissiveTriangles[i].area_pmf_cdf_pad.y;
+            return true;
+        }
+    }
+    return false;
+}
+
+float mediumPhaseHitEmitter(
+    vec3 scatterPos,
+    vec3 wo,
+    vec3 wi,
+    uint hitPrim,
+    float tHit,
+    float lambda,
+    float sigmaT,
+    float g
+) {
+    uint matIndex = triangleMaterialIndices[hitPrim];
+    Material mat = materials[matIndex];
+    vec3 emissive = mat.emissive_emissiveIntensity.xyz * mat.emissive_emissiveIntensity.w;
+
+    if (max(emissive.r, max(emissive.g, emissive.b)) <= 0.0) {
+        return 0.0;
+    }
+
+    float lightArea, lightPmf;
+    if (!getEmissiveTriangleInfo(hitPrim, lightArea, lightPmf)) {
+        return 0.0;
+    }
+    if (lightArea <= 0.0 || lightPmf <= 0.0) {
+        return 0.0;
+    }
+
+    vec3 v0, v1, v2;
+    loadTriangle(hitPrim, v0, v1, v2);
+    vec3 lightN = triangleNormal(v0, v1, v2);
+
+    float cosLight = max(dot(lightN, -wi), 0.0);
+    if (cosLight <= 1e-8) return 0.0;
+
+    float dist2 = tHit * tHit;
+    float pdfLightArea = lightPmf / lightArea;
+    float pdfLightW = pdfLightArea * dist2 / max(cosLight, 1e-8);
+
+    float pdfPhase = phaseHGPdf(dot(wo, wi), g);
+    float wPhase = pdfPhase / max(pdfPhase + pdfLightW, 1e-8);
+
+    float LeS = rgb_to_emission_spectrum(lambda, emissive);
+    float Tr = transmittanceHomogeneous(sigmaT, tHit);
+
+    return LeS * Tr * wPhase;
+}
+
+vec3 sampleGGXHalfVector(vec3 N, float alpha, vec2 u) {
+    float alpha2 = alpha * alpha;
+
+    float phi = 2.0 * PI * u.x;
+    float cosTheta = sqrt((1.0 - u.y) / (1.0 + (alpha2 - 1.0) * u.y));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+
+    vec3 T, B;
+    makeBasis(N, T, B);
+
+    return normalize(
+        T * (cos(phi) * sinTheta) +
+        B * (sin(phi) * sinTheta) +
+        N * cosTheta
+    );
+}
+
+vec3 sampleGGX(vec3 N, vec3 V, float smoothness, vec2 u) {
+    float alpha = alphaFromSmoothness(smoothness);
+    vec3 H = sampleGGXHalfVector(N, alpha, u);
+
+    if (dot(V, H) <= 0.0) {
+        return vec3(0.0);
+    }
+
+    vec3 L = reflect(-V, H);
+
+    if (dot(N, L) <= 0.0) {
+        return vec3(0.0);
+    }
+
+    return normalize(L);
+}
+
+float pdfDiffuse(vec3 N, vec3 L) {
+    float NoL = saturate(dot(N, L));
+    return NoL / PI;
+}
+
+float pdfGGXReflection(
+    vec3 N,
+    vec3 V,
+    vec3 L,
+    float smoothness
+) {
+    float NoV = saturate(dot(N, V));
+    float NoL = saturate(dot(N, L));
+    if (NoV <= 0.0 || NoL <= 0.0) return 0.0;
+
+    vec3 H = normalize(V + L);
+    float NoH = saturate(dot(N, H));
+    float VoH = saturate(dot(V, H));
+    if (VoH <= 0.0) return 0.0;
+
+    float roughness = roughnessFromSmoothness(smoothness);
+    float alpha = roughness * roughness;
+
+    float D = D_GGX(NoH, alpha);
+
+    // half-vector pdf converted to outgoing-direction pdf
+    float pdfH = D * NoH;
+    float pdfL = pdfH / max(4.0 * VoH, 1e-8);
+    return pdfL;
+}
+
+float lightPdfSolidAngleFromPrevVertex(
+    vec3 prevPos,
+    vec3 prevGeomN,
+    vec3 dir,
+    uint hitTriIndex
+) {
+    float lightArea, lightPmf;
+    if (!getEmissiveTriangleInfo(hitTriIndex, lightArea, lightPmf)) {
+        return 0.0;
+    }
+
+    if (lightArea <= 0.0 || lightPmf <= 0.0) {
+        return 0.0;
+    }
+
+    vec3 lv0, lv1, lv2;
+    loadTriangle(hitTriIndex, lv0, lv1, lv2);
+    vec3 lightN = triangleNormal(lv0, lv1, lv2);
+
+    uint prim;
+    float tHit;
+    vec2 bary;
+    if (!traceClosest(prevPos + prevGeomN * EPS, dir, prim, tHit, bary)) {
+        return 0.0;
+    }
+
+    if (prim != hitTriIndex) {
+        return 0.0;
+    }
+
+    vec3 hitPos = prevPos + dir * tHit;
+    float dist2 = dot(hitPos - prevPos, hitPos - prevPos);
+    if (dist2 <= 1e-12) {
+        return 0.0;
+    }
+
+    float cosLight = max(dot(lightN, -dir), 0.0);
+    if (cosLight <= 1e-8) {
+        return 0.0;
+    }
+
+    float pdfArea = lightPmf / lightArea;
+    return pdfArea * dist2 / max(cosLight, 1e-8);
+}
+
+float specularSamplingWeight(vec3 F0) {
+    return clamp(luminance(F0), 0.05, 0.95);
+}
+
+float fresnelDielectric(float cosThetaI, float etaI, float etaT) {
+    if (abs(etaI - etaT) < 1e-4) {
+        return 0.0;
+    }
+
+    cosThetaI = clamp(cosThetaI, -1.0, 1.0);
+
+    float sinThetaI = sqrt(max(0.0, 1.0 - cosThetaI * cosThetaI));
+    float sinThetaT = (etaI / etaT) * sinThetaI;
+
+    if (sinThetaT >= 1.0) {
+        return 1.0;
+    }
+
+    float cosThetaT = sqrt(max(0.0, 1.0 - sinThetaT * sinThetaT));
+
+    float rParl = ((etaT * cosThetaI) - (etaI * cosThetaT)) /
+                  ((etaT * cosThetaI) + (etaI * cosThetaT));
+    float rPerp = ((etaI * cosThetaI) - (etaT * cosThetaT)) /
+                  ((etaI * cosThetaI) + (etaT * cosThetaT));
+
+    return 0.5 * (rParl * rParl + rPerp * rPerp);
+}
+
+vec2 c_make(float re, float im) {
+    return vec2(re, im);
+}
+
+vec2 c_conj(vec2 z) {
+    return vec2(z.x, -z.y);
+}
+
+vec2 c_add(vec2 a, vec2 b) {
+    return a + b;
+}
+
+vec2 c_sub(vec2 a, vec2 b) {
+    return a - b;
+}
+
+vec2 c_mul(vec2 a, vec2 b) {
+    return vec2(
+        a.x * b.x - a.y * b.y,
+        a.x * b.y + a.y * b.x
+    );
+}
+
+vec2 c_scale(vec2 a, float s) {
+    return a * s;
+}
+
+vec2 c_div(vec2 a, vec2 b) {
+    float d = dot(b, b);
+    if (d <= 1e-20) return vec2(0.0);
+    return vec2(
+        (a.x * b.x + a.y * b.y) / d,
+        (a.y * b.x - a.x * b.y) / d
+    );
+}
+
+float c_abs2(vec2 z) {
+    return dot(z, z);
+}
+
+vec2 c_sqrt(vec2 z) {
+    float r = length(z);
+    float t = sqrt(max(0.0, 0.5 * (r + z.x)));
+    float u = sqrt(max(0.0, 0.5 * (r - z.x)));
+    float im = (z.y < 0.0) ? -u : u;
+    vec2 outZ = vec2(t, im);
+
+    // Pick the physically sensible branch more consistently.
+    if (outZ.x < 0.0) outZ = -outZ;
+    if (abs(outZ.x) < 1e-8 && outZ.y < 0.0) outZ = -outZ;
+    return outZ;
+}
+
+vec2 c_exp_i(float phi) {
+    return vec2(cos(phi), sin(phi));
+}
+
+vec2 complexCosThetaT(vec2 nI, vec2 nT, float sin2ThetaI) {
+    vec2 ratio = c_div(nI, nT);
+    vec2 ratio2 = c_mul(ratio, ratio);
+    vec2 arg = c_sub(vec2(1.0, 0.0), c_scale(ratio2, sin2ThetaI));
+    return c_sqrt(arg);
+}
+
+vec2 fresnelAmplitude_s(vec2 nI, vec2 nT, vec2 cosI, vec2 cosT) {
+    vec2 num = c_sub(c_mul(nI, cosI), c_mul(nT, cosT));
+    vec2 den = c_add(c_mul(nI, cosI), c_mul(nT, cosT));
+    return c_div(num, den);
+}
+
+vec2 fresnelAmplitude_p(vec2 nI, vec2 nT, vec2 cosI, vec2 cosT) {
+    vec2 num = c_sub(c_mul(nT, cosI), c_mul(nI, cosT));
+    vec2 den = c_add(c_mul(nT, cosI), c_mul(nI, cosT));
+    return c_div(num, den);
+}
+
+float thinFilmReflectanceOpaque(Material mat, float lambdaNm, float cosThetaI) {
+    float thicknessNm = max(mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.y, 0.0);
+    float filmIor     = max(mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.z, 1.0);
+    float subEta      = max(mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.w, 1e-4);
+    float subK        = max(mat.thinFilmSubstrateK_absorption_pad.x, 0.0);
+
+    cosThetaI = clamp(cosThetaI, 0.0, 1.0);
+
+    vec2 n0 = vec2(1.0, 0.0);
+    vec2 n1 = vec2(filmIor, 0.0);
+    vec2 n2 = vec2(subEta, subK);
+
+    float sin2ThetaI = max(0.0, 1.0 - cosThetaI * cosThetaI);
+
+    vec2 cos0 = vec2(cosThetaI, 0.0);
+    vec2 cos1 = complexCosThetaT(n0, n1, sin2ThetaI);
+    vec2 cos2 = complexCosThetaT(n0, n2, sin2ThetaI);
+
+    vec2 r01s = fresnelAmplitude_s(n0, n1, cos0, cos1);
+    vec2 r01p = fresnelAmplitude_p(n0, n1, cos0, cos1);
+
+    vec2 r12s = fresnelAmplitude_s(n1, n2, cos1, cos2);
+    vec2 r12p = fresnelAmplitude_p(n1, n2, cos1, cos2);
+
+    // Film phase: beta = 2*pi/lambda * n1 * d * cos(theta1)
+    // Since n1 is real here, beta is real.
+    float beta = (2.0 * PI * filmIor * thicknessNm * cos1.x) / max(lambdaNm, 1e-6);
+    vec2 e2ib = c_exp_i(2.0 * beta);
+
+    vec2 rs_num = c_add(r01s, c_mul(r12s, e2ib));
+    vec2 rs_den = c_add(vec2(1.0, 0.0), c_mul(c_mul(r01s, r12s), e2ib));
+    vec2 rp_num = c_add(r01p, c_mul(r12p, e2ib));
+    vec2 rp_den = c_add(vec2(1.0, 0.0), c_mul(c_mul(r01p, r12p), e2ib));
+
+    vec2 rs = c_div(rs_num, rs_den);
+    vec2 rp = c_div(rp_num, rp_den);
+
+    float Rs = c_abs2(rs);
+    float Rp = c_abs2(rp);
+
+    return clamp(0.5 * (Rs + Rp), 0.0, 1.0);
+}
+
+float fresnelConductor(float cosThetaI, float eta, float k) {
+    cosThetaI = clamp(cosThetaI, 0.0, 1.0);
+
+    float cos2 = cosThetaI * cosThetaI;
+    float sin2 = max(1.0 - cos2, 0.0);
+
+    float eta2 = eta * eta;
+    float k2   = k * k;
+
+    float t0 = eta2 - k2 - sin2;
+    float a2pb2 = sqrt(max(t0 * t0 + 4.0 * eta2 * k2, 0.0));
+    float a = sqrt(max(0.5 * (a2pb2 + t0), 0.0));
+
+    float t1 = a2pb2 + cos2;
+    float t2 = 2.0 * a * cosThetaI;
+    float Rs = (t1 - t2) / max(t1 + t2, 1e-8);
+
+    float t3 = cos2 * a2pb2 + sin2 * sin2;
+    float t4 = t2 * sin2;
+    float Rp = Rs * (t3 - t4) / max(t3 + t4, 1e-8);
+
+    return clamp(0.5 * (Rs + Rp), 0.0, 1.0);
+}
+
+float thinFilmReflectance(
+    float cosTheta,
+    float lambdaNm,
+    float baseF,
+    Material mat
+) {
+    float thicknessNm = max(mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.y, 0.0);
+    float nFilm       = max(mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.z, 1.0);
+    float etaSub      = max(mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.w, 1e-4);
+    float kSub        = max(mat.thinFilmSubstrateK_absorption_pad.x, 0.0);
+
+    if (thicknessNm <= 0.0 || nFilm <= 1.0001) {
+        return clamp(baseF, 0.0, 1.0);
+    }
+
+    cosTheta = clamp(cosTheta, 0.0, 1.0);
+
+    // Air -> film Snell
+    float sin2Theta = max(1.0 - cosTheta * cosTheta, 0.0);
+    float sin2Film = sin2Theta / max(nFilm * nFilm, 1e-8);
+
+    if (sin2Film >= 1.0) {
+        return 1.0;
+    }
+
+    float cosThetaFilm = sqrt(max(1.0 - sin2Film, 0.0));
+
+    float R01 = fresnelDielectric(cosTheta, 1.0, nFilm);
+
+    float etaRel = etaSub / nFilm;
+    float kRel   = kSub / nFilm;
+    float R12 = fresnelConductor(cosThetaFilm, etaRel, kRel);
+
+    float phase = 4.0 * PI * nFilm * thicknessNm * cosThetaFilm / max(lambdaNm, 1e-3);
+    float c = cos(phase);
+
+    // Scalar Airy-style interference.
+    float sqrtTerm = sqrt(max(R01 * R12, 0.0));
+    float num = R01 + R12 + 2.0 * sqrtTerm * c;
+    float den = 1.0 + R01 * R12 + 2.0 * sqrtTerm * c;
+
+    return clamp(num / max(den, 1e-6), 0.0, 1.0);
+}
+
+float opaqueSpecularSamplingWeight(
+    float albedoS,
+    float metallic,
+    float lambda,
+    Material mat
+) {
+    float baseF0 = mix(0.04, albedoS, metallic);
+    float coatedF0 = thinFilmReflectance(1.0, lambda, baseF0, mat);
+    return clamp(coatedF0, 0.05, 0.95);
+}
+
+bool refractDir(vec3 I, vec3 N, float eta, out vec3 T) {
+    // I points in ray direction (away from origin)
+    float cosNI = dot(N, I);
+    float k = 1.0 - eta * eta * (1.0 - cosNI * cosNI);
+    if (k < 0.0) {
+        return false;
+    }
+
+    T = normalize(eta * I - (eta * cosNI + sqrt(k)) * N);
+    return true;
+}
+
+float bsdfPdf(
+    vec3 N,
+    vec3 V,
+    vec3 L,
+    float albedoS,
+    float smoothness,
+    float metallic,
+    float lambda,
+    Material mat
+) {
+    float specW = opaqueSpecularSamplingWeight(albedoS, metallic, lambda, mat);
+    float diffW = 1.0 - specW;
+
+    float pdfD = pdfDiffuse(N, L);
+    float pdfS = pdfGGXReflection(N, V, L, smoothness);
+
+    return diffW * pdfD + specW * pdfS;
+}
+
+vec3 sampleBSDF(
+    vec3 N,
+    vec3 V,
+    float albedoS,
+    float smoothness,
+    float metallic,
+    float lambda,
+    Material mat,
+    vec2 uSelect,
+    vec2 uDir,
+    out float outPdf
+) {
+    float specW = opaqueSpecularSamplingWeight(albedoS, metallic, lambda, mat);
+    float diffW = 1.0 - specW;
+
+    vec3 L;
+    if (uSelect.x < diffW) {
+        L = sampleCosineHemisphere(N, uDir);
+    } else {
+        L = sampleGGX(N, V, smoothness, uDir);
+    }
+
+    outPdf = bsdfPdf(N, V, L, albedoS, smoothness, metallic, lambda, mat);
+    return L;
+}
+
+float evalDielectricMicrofacet(
+    vec3 N,
+    vec3 V,
+    vec3 L,
+    float roughness,
+    float etaI,
+    float etaT,
+    out bool isTransmission
+) {
+    float NoV = dot(N, V);
+    float NoL = dot(N, L);
+
+    if (abs(NoV) < 1e-6 || abs(NoL) < 1e-6) {
+        isTransmission = false;
+        return 0.0;
+    }
+
+    bool reflectMode = (NoV * NoL > 0.0);
+    isTransmission = !reflectMode;
+
+    float alpha = max(0.001, roughness * roughness);
+
+    if (reflectMode) {
+        vec3 H = normalize(V + L);
+        if (dot(H, N) < 0.0) H = -H;
+
+        float NoH = saturate(dot(N, H));
+        float VoH = saturate(dot(V, H));
+        if (VoH <= 1e-8) return 0.0;
+
+        float F = fresnelDielectric(VoH, etaI, etaT);
+        float D = D_GGX(NoH, alpha);
+        float G = G_SmithGGX(abs(NoV), abs(NoL), alpha);
+
+        return F * D * G / max(4.0 * abs(NoV) * abs(NoL), 1e-8);
+    } else {
+        vec3 Hraw = -(etaI * V + etaT * L);
+        float h2 = dot(Hraw, Hraw);
+        if (h2 <= 1e-12) return 0.0;
+
+        vec3 H = Hraw * inversesqrt(h2);
+        if (dot(H, N) < 0.0) H = -H;
+
+        float NoH = saturate(dot(N, H));
+        float VoH = abs(dot(V, H));
+        float LoH = abs(dot(L, H));
+
+        if (VoH <= 1e-8 || LoH <= 1e-8) return 0.0;
+
+        float F = fresnelDielectric(VoH, etaI, etaT);
+        float D = D_GGX(NoH, alpha);
+        float G = G_SmithGGX(abs(NoV), abs(NoL), alpha);
+
+        float denom = etaI * VoH + etaT * LoH;
+        float factor = (VoH * LoH) /
+            max(abs(NoV) * abs(NoL) * denom * denom, 1e-8);
+
+        return ((1.0 - F) * D * G * factor);
+    }
+}
+
+float pdfDielectricMicrofacet(
+    vec3 N,
+    vec3 V,
+    vec3 L,
+    float roughness,
+    float etaI,
+    float etaT
+) {
+    float NoV = dot(N, V);
+    float NoL = dot(N, L);
+
+    if (abs(NoV) < 1e-6 || abs(NoL) < 1e-6) {
+        return 0.0;
+    }
+
+    float alpha = max(0.001, roughness * roughness);
+    bool reflectMode = (NoV * NoL > 0.0);
+
+    if (reflectMode) {
+        vec3 H = normalize(V + L);
+        if (dot(H, N) < 0.0) H = -H;
+
+        float NoH = saturate(dot(N, H));
+        float VoH = abs(dot(V, H));
+        if (VoH <= 1e-8) return 0.0;
+
+        float D = D_GGX(NoH, alpha);
+        float pdfH = D * NoH;
+        return pdfH / max(4.0 * VoH, 1e-8);
+    } else {
+        vec3 Hraw = -(etaI * V + etaT * L);
+        float h2 = dot(Hraw, Hraw);
+        if (h2 <= 1e-12) {
+            return 0.0;
+        }
+        vec3 H = Hraw * inversesqrt(h2);
+        if (dot(H, N) < 0.0) H = -H;
+
+        float NoH = saturate(dot(N, H));
+        float VoH = abs(dot(V, H));
+        float LoH = abs(dot(L, H));
+
+        float denom = etaI * VoH + etaT * LoH;
+        if (VoH <= 1e-8 || LoH <= 1e-8 || denom <= 1e-8) {
+            return 0.0;
+        }
+
+        float D = D_GGX(NoH, alpha);
+        float pdfH = D * NoH;
+
+        float dwh_dwo = (etaT * etaT * LoH) / max(denom * denom, 1e-8);
+        return pdfH * dwh_dwo;
+    }
+}
+
+DielectricSample sampleDielectricBSDF(
+    vec3 N,
+    vec3 V,
+    bool frontFace,
+    float albedoS,
+    float smoothness,
+    float ior,
+    inout uint rng
+) {
+    DielectricSample s;
+    s.dir = vec3(0.0);
+    s.f = 0.0;
+    s.pdf = 0.0;
+    s.isTransmission = 0u;
+    s.isDelta = 0u;
+
+    float roughness = roughnessFromSmoothness(smoothness);
+    float etaI = frontFace ? 1.0 : ior;
+    float etaT = frontFace ? ior : 1.0;
+    float eta  = etaI / etaT;
+
+    // Rough dielectric (I don't handle delta dielectric because I don't want to. Also, it's not technically required)
+    float alpha = alphaFromSmoothness(smoothness);
+    vec3 H = sampleGGXHalfVector(N, alpha, vec2(rand01(rng), rand01(rng)));
+    if (dot(V, H) < 0.0) {
+        H = -H;
+    }
+
+    float Fr = fresnelDielectric(clamp(abs(dot(V, H)), 0.0, 1.0), etaI, etaT);
+
+    if (isDeltaSpecular(smoothness)) {
+        float Fr = fresnelDielectric(clamp(dot(V, N), 0.0, 1.0), etaI, etaT);
+
+        if (rand01(rng) < Fr) {
+            vec3 L = reflect(-V, N);
+            float absNoL = max(abs(dot(N, L)), 1e-8);
+
+            s.dir = normalize(L);
+            s.f = Fr / absNoL;
+            s.pdf = max(Fr, 1e-8);
+            s.isTransmission = 0u;
+            s.isDelta = 1u;
+            return s;
+        } else {
+            vec3 L;
+            if (!refractDir(-V, N, eta, L)) {
+                return s;
+            }
+
+            float absNoL = max(abs(dot(N, L)), 1e-8);
+
+            s.dir = normalize(L);
+            s.f = (1.0 - Fr) / absNoL;
+            s.pdf = max(1.0 - Fr, 1e-8);
+            s.isTransmission = 1u;
+            s.isDelta = 1u;
+            return s;
+        }
+    }
+
+    if (rand01(rng) < Fr) {
+        vec3 L = reflect(-V, H);
+
+        float NoV = abs(dot(N, V));
+        float NoL = abs(dot(N, L));
+        if (NoV <= 1e-8 || NoL <= 1e-8) {
+            return s;
+        }
+
+        bool isTransmission = false;
+        float f = evalDielectricMicrofacet(N, V, L, roughness, etaI, etaT, isTransmission);
+        float pdf = pdfDielectricMicrofacet(N, V, L, roughness, etaI, etaT);
+
+        if (isTransmission || f <= 1e-8 || pdf <= 1e-8) {
+            return s;
+        }
+
+        s.dir = normalize(L);
+        s.f = f;
+        s.pdf = max(Fr * pdf, 1e-8);
+        s.isTransmission = 0u;
+        s.isDelta = 0u;
+        return s;
+    } else {
+        vec3 L;
+        if (!refractDir(-V, H, eta, L)) {
+            return s;
+        }
+
+        float NoV = abs(dot(N, V));
+        float NoL = abs(dot(N, L));
+        if (NoV <= 1e-8 || NoL <= 1e-8) {
+            return s;
+        }
+
+        bool isTransmission = false;
+        float f = evalDielectricMicrofacet(N, V, L, roughness, etaI, etaT, isTransmission);
+        float pdf = pdfDielectricMicrofacet(N, V, L, roughness, etaI, etaT);
+
+        if (!isTransmission || f <= 1e-8 || pdf <= 1e-8) {
+            return s;
+        }
+
+        s.dir = normalize(L);
+        s.f = f;
+        s.pdf = max((1.0 - Fr) * pdf, 1e-8);
+        s.isTransmission = 1u;
+        s.isDelta = 0u;
+        return s;
+    }
+}
+
+float evalBSDFScalar(
+    vec3 N,
+    vec3 V,
+    vec3 L,
+    float albedoS,
+    float smoothness,
+    float metallic,
+    Material mat,
+    float lambda
+) {
+    float NoV = saturate(dot(N, V));
+    float NoL = saturate(dot(N, L));
+    if (NoV <= 0.0 || NoL <= 0.0) return 0.0;
+
+    vec3 H = normalize(V + L);
+    float NoH = saturate(dot(N, H));
+    float VoH = saturate(dot(V, H));
+
+    float roughness = roughnessFromSmoothness(smoothness);
+    float alpha = roughness * roughness;
+
+    float transmission = mat.metallic_smoothShading_transmission_ior.z;
+    float filmThickness = mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.y;
+
+    float F;
+    if (transmission <= 0.001 && filmThickness > 0.0) {
+        F = thinFilmReflectanceOpaque(mat, lambda, VoH);
+    } else {
+        float F0 = mix(0.04, albedoS, metallic);
+        F = fresnelSchlickScalar(VoH, F0);
+    }
+
     float D = D_GGX(NoH, alpha);
     float G = G_SmithGGX(NoV, NoL, alpha);
 
@@ -2907,7 +4534,7 @@ float mneeAreaLightDirect(
             float cosI = abs(dot(-wi, n));
             float F = fresnelDielectric(cosI, etaI, etaT);
 
-            specW *= tr * (1.0 - F) * surfTintT;
+            specW *= tr * (1.0 - F);
 
             float eta2 = (etaI * etaI) / max(etaT * etaT, 1e-8);
             specW *= eta2;
@@ -2915,7 +4542,7 @@ float mneeAreaLightDirect(
             bool wasAir = (etaFrom == 1.0);
             if (wasAir) {
                 inGlass = true;
-                sigmaA_glass = -log(max(tintS, MIN_T)) * GLASS_ABSORB_SCALE * tr;
+                sigmaA_glass = -log(max(tintS, MIN_T)) * matS.thinFilmSubstrateK_absorption_pad.y * tr;
             } else {
                 inGlass = false;
             }
@@ -3016,6 +4643,9 @@ void main() {
         float throughput = 1.0;
         vec3 radianceXYZ = vec3(0.0);
 
+        bool pathInsideGlass = false;
+        float pathSigmaA = 0.0;
+
         for (uint bounce = 0u; bounce < frame.extra.w; ++bounce) {
             uint prim = 0u;
             float tHit = INF_T;
@@ -3107,6 +4737,8 @@ void main() {
                 }
                 lastBounce = bounce;
                 break;
+            } else if (pathInsideGlass) {
+                throughput *= exp(-pathSigmaA * tHit);
             }
 
             vec3 v0, v1, v2;
@@ -3237,7 +4869,7 @@ void main() {
                                 bool isTransmissionMode = false;
                                 fS = evalDielectricMicrofacet(Ns, V, L,
                                                              roughnessFromSmoothness(smoothness),
-                                                             etaI, etaT, albedoS,
+                                                             etaI, etaT,
                                                              isTransmissionMode);
                                 pdfBsdf = pdfDielectricMicrofacet(Ns, V, L,
                                                                  roughnessFromSmoothness(smoothness),
@@ -3247,8 +4879,8 @@ void main() {
                             } else if (transmission <= 0.001) {
                                 float NoL = saturate(dot(Ns, L));
                                 if (NoL > 0.0) {
-                                    fS = evalBSDFScalar(Ns, V, L, albedoS, smoothness, metallic);
-                                    pdfBsdf = bsdfPdf(Ns, V, L, vec3(albedoS), smoothness, metallic);
+                                    fS = evalBSDFScalar(Ns, V, L, albedoS, smoothness, metallic, mat, lambda);
+                                    pdfBsdf = bsdfPdf(Ns, V, L, albedoS, smoothness, metallic, lambda, mat);
                                     cosTerm = NoL;
                                     valid = (fS > 0.0 && pdfBsdf > 0.0);
                                 }
@@ -3289,6 +4921,16 @@ void main() {
                 throughput *= ds.f * absNoL / ds.pdf;
 
                 newDir = normalize(ds.dir);
+
+                if (ds.isTransmission != 0u) {
+                    if (frontFace) {
+                        pathInsideGlass = true;
+                        pathSigmaA = materialAbsorptionSigma(prim, lambda);
+                    } else {
+                        pathInsideGlass = false;
+                        pathSigmaA = 0.0;
+                    }
+                }
                 wasSpecularEvent = (ds.isDelta != 0u);
 
                 prevBsdfPdfW = ds.pdf;
@@ -3302,8 +4944,14 @@ void main() {
             } else if (isOpaqueDeltaSpecular(transmission, metallic, smoothness)) {
                 vec3 R = reflect(-V, Ns);
 
-                float F0 = mix(0.04, albedoS, metallic);
-                float F = fresnelSchlickScalar(saturate(dot(Ns, V)), F0);
+                float filmThickness = mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.y;
+                float F;
+                if (filmThickness > 0.0) {
+                    F = thinFilmReflectanceOpaque(mat, lambda, saturate(dot(Ns, V)));
+                } else {
+                    float F0 = mix(0.04, albedoS, metallic);
+                    F = fresnelSchlickScalar(saturate(dot(Ns, V)), F0);
+                }
 
                 throughput *= F;
                 wasSpecularEvent = true;
@@ -3321,7 +4969,7 @@ void main() {
                 vec2 uDir    = vec2(rand01(rng), rand01(rng));
 
                 float pdf;
-                newDir = sampleBSDF(Ns, V, albedo, smoothness, metallic, uSelect, uDir, pdf);
+                newDir = sampleBSDF(Ns, V, albedoS, smoothness, metallic, lambda, mat, uSelect, uDir, pdf);
 
                 float NoL = max(dot(Ns, newDir), 0.0);
                 if (pdf <= 1e-8 || NoL <= 0.0) {
@@ -3329,7 +4977,466 @@ void main() {
                     break;
                 }
 
-                float fS = evalBSDFScalar(Ns, V, newDir, albedoS, smoothness, metallic);
+                float fS = evalBSDFScalar(Ns, V, newDir, albedoS, smoothness, metallic, mat, lambda);
+                throughput *= fS * NoL / max(pdf, 1e-8);
+
+                vec3 F0 = mix(vec3(0.04), albedo, metallic);
+                float specW = specularSamplingWeight(F0);
+                wasSpecularEvent = (metallic > 0.5 || smoothness > 0.95 || specW > 0.5);
+
+                prevBsdfPdfW = pdf;
+                prevNeePdfW  = 0.0;
+                prevHadNee   = true;
+                prevWasDeltaEvent = false;
+
+                vec3 pushNg = dot(newDir, Ng) >= 0.0 ? Ng : -Ng;
+                vec3 rayStart = hitPos + pushNg * EPS + newDir * EPS;
+
+                uint nextPrim;
+                float nextTHit;
+                vec2 nextBary;
+                if (traceClosest(rayStart, newDir, nextPrim, nextTHit, nextBary)) {
+                    uint nextMatIndex = triangleMaterialIndices[nextPrim];
+                    Material nextMat = materials[nextMatIndex];
+                    vec3 nextEmissive = nextMat.emissive_emissiveIntensity.xyz *
+                                        nextMat.emissive_emissiveIntensity.w;
+
+                    if (max(nextEmissive.r, max(nextEmissive.g, nextEmissive.b)) > 0.0) {
+                        prevNeePdfW = lightPdfSolidAngleFromPrevVertex(hitPos, pushNg, newDir, nextPrim);
+                    }
+                }
+
+                ro = rayStart;
+                rd = normalize(newDir);
+            }
+
+            lastRo = ro;
+            lastRd = rd;
+            lastThroughput = throughput;
+            lastLambda = lambda;
+            lastRadianceXYZ = radianceXYZ;
+            lastBounce = bounce + 1u;
+        }
+
+        totalRadianceXYZ += radianceXYZ;
+    }
+
+    vec3 radianceXYZ = totalRadianceXYZ / float(LAMBDA_SPP);
+
+    paths[pixelIndex].ro = vec4(lastRo, 0.0);
+    paths[pixelIndex].rd = vec4(lastRd, 0.0);
+    paths[pixelIndex].throughput_lambda = vec4(lastThroughput, lastLambda, 0.0, 0.0);
+    paths[pixelIndex].radianceXYZ = vec4(radianceXYZ, 0.0);
+    paths[pixelIndex].pixelIndex = pixelIndex;
+    paths[pixelIndex].alive = 0u;
+    paths[pixelIndex].bounce = lastBounce;
+
+    ivec2 ipix = ivec2(pix);
+
+    vec4 prevAccum = imageLoad(accumImage, ipix);
+    float frameIndex = float(frame.screen.w);
+
+    vec3 sampleRGB = xyz_to_linear_srgb(radianceXYZ);
+    sampleRGB /= max(frame.whiteBalance.xyz, vec3(1e-6));
+
+    vec3 accumColor = (frame.screen.w == 0u)
+        ? clamp_rgb_luma(sampleRGB, RGB_CLAMP)
+        : clamp_rgb_luma((prevAccum.xyz * frameIndex + sampleRGB) / (frameIndex + 1.0), RGB_CLAMP);
+
+    imageStore(accumImage, ipix, vec4(accumColor, 1.0));
+    imageStore(outImage,   ipix, vec4(sampleRGB, 1.0));
+}
+
+void main() {
+    uvec2 pix = gl_GlobalInvocationID.xy;
+    uint width = frame.screen.x;
+    uint height = frame.screen.y;
+
+    if (pix.x >= width || pix.y >= height) return;
+
+    uint pixelIndex = pix.y * width + pix.x;
+
+    vec2 uv = (vec2(pix) + vec2(0.5)) / vec2(width, height);
+    vec2 ndc = uv * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+
+    float tanHalfFovY = frame.camData.x;
+    float aspect = frame.camData.y;
+
+    vec3 camRo = frame.camPos.xyz;
+    vec3 camRd = normalize(
+        frame.camForward.xyz +
+        ndc.x * aspect * tanHalfFovY * frame.camRight.xyz +
+        ndc.y * tanHalfFovY * frame.camUp.xyz
+    );
+
+    const uint LAMBDA_SPP = 4u;
+
+    vec3 totalRadianceXYZ = vec3(0.0);
+
+    // Keep some final state for the debug/path buffer write at end.
+    float lastThroughput = 1.0;
+    float lastLambda = 550.0;
+    vec3 lastRadianceXYZ = vec3(0.0);
+    vec3 lastRo = camRo;
+    vec3 lastRd = camRd;
+    uint lastBounce = 0u;
+
+    float prevBsdfPdfW = 0.0;
+    float prevNeePdfW  = 0.0;
+    bool  prevHadNee   = false;
+    bool  prevWasDeltaEvent = true;
+
+    for (uint ls = 0u; ls < LAMBDA_SPP; ++ls) {
+        uint rng = pixelIndex * 9781u +
+                   frame.screen.w * 6271u +
+                   ls * 26699u + 1u;
+
+        vec3 ro = camRo;
+        vec3 rd = camRd;
+
+        float uLambda = (float(ls) + rand01(rng)) / float(LAMBDA_SPP);
+        float lambda = mix(LAMBDA_MIN, LAMBDA_MAX, uLambda);
+        vec3 lambdaXYZ = cie_xyz_bar(lambda) * (LAMBDA_MAX - LAMBDA_MIN);
+
+        float throughput = 1.0;
+        vec3 radianceXYZ = vec3(0.0);
+
+        bool pathInsideGlass = false;
+        float pathSigmaA = 0.0;
+
+        for (uint bounce = 0u; bounce < frame.extra.w; ++bounce) {
+            uint prim = 0u;
+            float tHit = INF_T;
+            vec2 bary = vec2(0.0);
+            bool hitSurface = traceClosest(ro, rd, prim, tHit, bary);
+
+            float sigmaT = (frame.extra.z != 0u) ? max(frame.fogParams.x, 0.0) : 0.0;
+            float fogG   = clamp(frame.fogParams.y, -0.99, 0.99);
+
+            if (sigmaT > 0.0) {
+                float tScatter = sampleFreeFlight(sigmaT, rng);
+
+                if (tScatter < tHit) {
+                    vec3 scatterPos = ro + rd * tScatter;
+
+                    vec3 wo = -rd;
+
+                    // NEE to sun
+                    if (frame.extra.y != 0u) {
+                        float sunC = mediumSunDirect(scatterPos, wo, lambda, sigmaT, fogG);
+                        radianceXYZ += (throughput * sunC) * lambdaXYZ;
+                    }
+
+                    // NEE to emissive triangles with MIS against phase sampling
+                    if (frame.extra.x != 0u) {
+                        float areaC = mediumAreaLightDirect(scatterPos, wo, lambda, sigmaT, fogG, rng);
+                        radianceXYZ += (throughput * areaC) * lambdaXYZ;
+                    }
+
+                    // Sample phase function for indirect continuation
+                    float pdfPhase;
+                    vec3 newDir = samplePhaseHG(wo, fogG, vec2(rand01(rng), rand01(rng)), pdfPhase);
+                    if (pdfPhase <= 1e-8) {
+                        lastBounce = bounce;
+                        break;
+                    }
+
+                    // Check if the phase-sampled ray immediately hits an emitter or escapes to sun.
+                    uint mPrim;
+                    float mTHit;
+                    vec2 mBary;
+                    bool mHit = traceClosest(scatterPos + newDir * MEDIUM_EPS, newDir, mPrim, mTHit, mBary);
+
+                    if (mHit) {
+                        float hitLe = mediumPhaseHitEmitter(
+                            scatterPos, wo, newDir, mPrim, mTHit, lambda, sigmaT, fogG
+                        );
+                        if (hitLe > 0.0) {
+                            radianceXYZ += (throughput * hitLe) * lambdaXYZ;
+                        }
+                    } else if (frame.extra.y != 0u) {
+                        vec3 sunDir = normalize(frame.sunDirIntensity.xyz);
+                        float cosToSun = dot(newDir, sunDir);
+                        if (cosToSun > 0.99995) {
+                            float pdfSun = 1.0; // delta light not sampled by phase path in measure-consistent way
+                            float pdfPhaseHit = phaseHGPdf(dot(wo, newDir), fogG);
+                            float wPhase = 1.0; // directional sun handled as pure NEE in this simple implementation
+                            float LeS = rgb_to_emission_spectrum(lambda, frame.sunColor.xyz * frame.sunDirIntensity.w);
+                            radianceXYZ += (throughput * LeS * wPhase) * lambdaXYZ;
+                        }
+                    }
+
+                    throughput = min(throughput, 20.0);
+
+                    ro = scatterPos + newDir * MEDIUM_EPS;
+                    rd = newDir;
+
+                    lastRo = ro;
+                    lastRd = rd;
+                    lastThroughput = throughput;
+                    lastLambda = lambda;
+                    lastRadianceXYZ = radianceXYZ;
+                    lastBounce = bounce + 1u;
+                    continue;
+                }
+
+                // No medium event before surface: apply beam transmittance
+                if (tHit < 1e30 && tHit > -1e30) {
+                    throughput *= transmittanceHomogeneous(sigmaT, tHit);
+                }
+            }
+
+            if (!hitSurface) {
+                tHit = INF_T;
+                if (bounce == 0u) {
+                    imageStore(albedoImage, ivec2(pix), vec4(0.0, 0.0, 0.0, 1.0));
+                    imageStore(normalImage, ivec2(pix), vec4(0.5, 0.5, 1.0, 1.0));
+                    imageStore(depthImage, ivec2(pix), vec4(1e30, 0.0, 0.0, 1.0));
+                }
+                lastBounce = bounce;
+                break;
+            } else if (pathInsideGlass) {
+                throughput *= exp(-pathSigmaA * tHit);
+            }
+
+            vec3 v0, v1, v2;
+            loadTriangle(prim, v0, v1, v2);
+
+            uint i0 = indexData[prim * 3u + 0u];
+            uint i1 = indexData[prim * 3u + 1u];
+            uint i2 = indexData[prim * 3u + 2u];
+
+            vec3 geomN = triangleNormal(v0, v1, v2);
+            vec3 hitPos = ro + rd * tHit;
+            vec3 V = normalize(-rd);
+
+            uint matIndex = triangleMaterialIndices[prim];
+            Material mat = materials[matIndex];
+
+            vec3 albedo = mat.albedo_smoothness.xyz;
+            float smoothness = mat.albedo_smoothness.w;
+            float metallic = mat.metallic_smoothShading_transmission_ior.x;
+            float transmission = mat.metallic_smoothShading_transmission_ior.z;
+            float ior = mat.metallic_smoothShading_transmission_ior.w;
+            vec3 emissive = mat.emissive_emissiveIntensity.xyz * mat.emissive_emissiveIntensity.w;
+
+            float dispersion = mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.x;
+
+            float albedoS = rgb_to_reflectance_spectrum(lambda, albedo);
+            float emissiveS = rgb_to_emission_spectrum(lambda, emissive);
+            float iorLambda = iorAtLambda(ior, dispersion, lambda);
+
+            float b1 = bary.x;
+            float b2 = bary.y;
+            float b0 = 1.0 - b1 - b2;
+
+            vec3 n0 = loadNormal(i0);
+            vec3 n1 = loadNormal(i1);
+            vec3 n2 = loadNormal(i2);
+
+            float smoothShading = mat.metallic_smoothShading_transmission_ior.y;
+            vec3 smoothN = normalize(n0 * b0 + n1 * b1 + n2 * b2);
+
+            bool frontFace = dot(rd, geomN) < 0.0;
+            vec3 Ng = frontFace ? geomN : -geomN;
+
+            vec3 rawShadeN = (smoothShading > 0.5) ? smoothN : Ng;
+            vec3 Ns = normalize(dot(rawShadeN, Ng) >= 0.0 ? rawShadeN : -rawShadeN);
+
+            // Screen-space caustic lookup on primary diffuse-ish receivers
+            if (bounce == 0u && transmission <= 0.001 && metallic < 0.2 && smoothness < 0.3) {
+                vec3 causticXYZ = sampleCausticsImageXYZ(ivec2(pix));
+
+                vec3 diffuseRGB = albedo / PI;
+
+                vec3 causticRGB = xyz_to_linear_srgb(causticXYZ);
+                causticRGB *= diffuseRGB;
+
+                vec3 causticReflectedXYZ = linear_srgb_to_xyz(causticRGB);
+
+                radianceXYZ += throughput * frame.misc.x * causticReflectedXYZ;
+            }
+
+            if (max(emissive.r, max(emissive.g, emissive.b)) > 0.0) {
+                float wEmit = 1.0;
+
+                if (bounce > 0u && !prevWasDeltaEvent && prevHadNee) {
+                    wEmit = prevBsdfPdfW / max(prevBsdfPdfW + prevNeePdfW, 1e-8);
+                }
+
+                radianceXYZ += (throughput * emissiveS * wEmit) * lambdaXYZ;
+            }
+
+            // Store to output textures for denoising
+            if (bounce == 0u) {
+                imageStore(albedoImage, ivec2(pix), vec4(albedo, 1.0));
+                imageStore(normalImage, ivec2(pix), vec4(Ns, 1.0));
+                imageStore(depthImage, ivec2(pix), vec4(tHit, 0.0, 0.0, 1.0));
+            }
+
+            // Area-light NEE
+            if (frame.extra.x > 0u) {
+                uint lightSlot = sampleEmissiveTriangle(rand01(rng));
+                uint lightTriIndex = emissiveTriangles[lightSlot].triIndex_pad.x;
+                float lightArea = emissiveTriangles[lightSlot].area_pmf_cdf_pad.x;
+                float lightPmf = emissiveTriangles[lightSlot].area_pmf_cdf_pad.y;
+
+                vec3 lv0, lv1, lv2;
+                loadTriangle(lightTriIndex, lv0, lv1, lv2);
+
+                vec2 u = vec2(rand01(rng), rand01(rng));
+                vec2 b = sampleUniformTriangle(u);
+                float w0 = 1.0 - b.x - b.y;
+                float w1 = b.x;
+                float w2 = b.y;
+
+                vec3 lightPos = w0 * lv0 + w1 * lv1 + w2 * lv2;
+                vec3 lightN = triangleNormal(lv0, lv1, lv2);
+
+                uint lightMatIndex = triangleMaterialIndices[lightTriIndex];
+                Material lightMat = materials[lightMatIndex];
+                vec3 Le = lightMat.emissive_emissiveIntensity.xyz * lightMat.emissive_emissiveIntensity.w;
+
+                vec3 toLight = lightPos - hitPos;
+                float dist2 = dot(toLight, toLight);
+
+                if (dist2 > EPS && lightPmf > 0.0 && lightArea > 0.0) {
+                    float dist = sqrt(dist2);
+                    vec3 L = toLight / dist;
+
+                    float cosLight = max(dot(lightN, -L), 0.0);
+                    if (cosLight > 0.0) {
+                        vec3 shadowOffsetN = dot(L, Ng) >= 0.0 ? Ng : -Ng;
+                        bool occluded = traceShadow(hitPos + shadowOffsetN * EPS, L, dist, lightTriIndex);
+
+                        if (!occluded) {
+                            float pdfLight = lightPmf / lightArea;
+                            float pdfLightSolidAngle = pdfLight * dist2 / max(cosLight, 1e-8);
+
+                            float LeS = rgb_to_emission_spectrum(lambda, Le);
+
+                            float fS = 0.0;
+                            float pdfBsdf = 0.0;
+                            float cosTerm = 0.0;
+                            bool valid = false;
+
+                            if (transmission > 0.001 && !isDeltaSpecular(smoothness)) {
+                                float etaI = frontFace ? 1.0 : iorLambda;
+                                float etaT = frontFace ? iorLambda : 1.0;
+
+                                bool isTransmissionMode = false;
+                                fS = evalDielectricMicrofacet(Ns, V, L,
+                                                             roughnessFromSmoothness(smoothness),
+                                                             etaI, etaT,
+                                                             isTransmissionMode);
+                                pdfBsdf = pdfDielectricMicrofacet(Ns, V, L,
+                                                                 roughnessFromSmoothness(smoothness),
+                                                                 etaI, etaT);
+                                cosTerm = abs(dot(Ns, L));
+                                valid = (fS > 0.0 && pdfBsdf > 0.0 && cosTerm > 0.0);
+                            } else if (transmission <= 0.001) {
+                                float NoL = saturate(dot(Ns, L));
+                                if (NoL > 0.0) {
+                                    fS = evalBSDFScalar(Ns, V, L, albedoS, smoothness, metallic, mat, lambda);
+                                    pdfBsdf = bsdfPdf(Ns, V, L, albedoS, smoothness, metallic, lambda, mat);
+                                    cosTerm = NoL;
+                                    valid = (fS > 0.0 && pdfBsdf > 0.0);
+                                }
+                            }
+
+                            if (valid) {
+                                float wLight = pdfLightSolidAngle / max(pdfLightSolidAngle + pdfBsdf, 1e-8);
+                                float contrib = LeS * fS * cosTerm * wLight / max(pdfLightSolidAngle, 1e-8);
+                                radianceXYZ += (throughput * contrib) * lambdaXYZ;
+                            }
+                        }
+                    }
+                }
+            }
+
+            float rrP = clamp(throughput, 0.05, 0.95);
+            if (bounce >= 2u) {
+                if (rand01(rng) > rrP) {
+                    lastBounce = bounce;
+                    break;
+                }
+                throughput /= rrP;
+            }
+
+            vec3 newDir;
+            bool wasSpecularEvent = false;
+
+            if (transmission > 0.001) {
+                vec3 Nd = Ns;
+                DielectricSample ds = sampleDielectricBSDF(Nd, V, frontFace, albedoS, smoothness, iorLambda, rng);
+
+                float absNoL = abs(dot(Nd, ds.dir));
+                if (ds.pdf <= 1e-8 || absNoL <= 1e-8 || ds.f <= 1e-8) {
+                    lastBounce = bounce;
+                    break;
+                }
+
+                throughput *= ds.f * absNoL / ds.pdf;
+
+                newDir = normalize(ds.dir);
+
+                if (ds.isTransmission != 0u) {
+                    if (frontFace) {
+                        pathInsideGlass = true;
+                        pathSigmaA = materialAbsorptionSigma(prim, lambda);
+                    } else {
+                        pathInsideGlass = false;
+                        pathSigmaA = 0.0;
+                    }
+                }
+                wasSpecularEvent = (ds.isDelta != 0u);
+
+                prevBsdfPdfW = ds.pdf;
+                prevNeePdfW  = 0.0;
+                prevHadNee   = false;
+                prevWasDeltaEvent = (ds.isDelta != 0u);
+
+                vec3 pushNg = dot(newDir, Ng) >= 0.0 ? Ng : -Ng;
+                ro = hitPos + pushNg * EPS + newDir * EPS;
+                rd = newDir;
+            } else if (isOpaqueDeltaSpecular(transmission, metallic, smoothness)) {
+                vec3 R = reflect(-V, Ns);
+
+                float filmThickness = mat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta.y;
+                float F;
+                if (filmThickness > 0.0) {
+                    F = thinFilmReflectanceOpaque(mat, lambda, saturate(dot(Ns, V)));
+                } else {
+                    float F0 = mix(0.04, albedoS, metallic);
+                    F = fresnelSchlickScalar(saturate(dot(Ns, V)), F0);
+                }
+
+                throughput *= F;
+                wasSpecularEvent = true;
+
+                prevBsdfPdfW = 0.0;
+                prevNeePdfW  = 0.0;
+                prevHadNee   = false;
+                prevWasDeltaEvent = true;
+
+                vec3 pushNg = dot(R, Ng) >= 0.0 ? Ng : -Ng;
+                ro = hitPos + pushNg * EPS + R * EPS;
+                rd = normalize(R);
+            } else {
+                vec2 uSelect = vec2(rand01(rng), rand01(rng));
+                vec2 uDir    = vec2(rand01(rng), rand01(rng));
+
+                float pdf;
+                newDir = sampleBSDF(Ns, V, albedoS, smoothness, metallic, lambda, mat, uSelect, uDir, pdf);
+
+                float NoL = max(dot(Ns, newDir), 0.0);
+                if (pdf <= 1e-8 || NoL <= 0.0) {
+                    lastBounce = bounce;
+                    break;
+                }
+
+                float fS = evalBSDFScalar(Ns, V, newDir, albedoS, smoothness, metallic, mat, lambda);
                 throughput *= fS * NoL / max(pdf, 1e-8);
 
                 vec3 F0 = mix(vec3(0.04), albedo, metallic);

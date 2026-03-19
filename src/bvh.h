@@ -17,7 +17,7 @@ struct Material {
     float emissive_emissiveIntensity[4];
     float metallic_smoothShading_transmission_ior[4];
     float dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[4];
-    float thinFilmSubstrateK_pad[4];
+    float thinFilmSubstrateK_absorption_pad[4];
 };
 
 struct EmissiveTriangle {

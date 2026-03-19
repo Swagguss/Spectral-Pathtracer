@@ -304,6 +304,7 @@ static bool drawMaterialEditor(MeshData& mesh, int& selectedMaterial) {
     changed |= ImGui::SliderFloat("Metallic", &m.metallic_smoothShading_transmission_ior[0], 0.0f, 1.0f);
     changed |= ImGui::SliderFloat("Smooth Shading", &m.metallic_smoothShading_transmission_ior[1], 0.0f, 1.0f);
     changed |= ImGui::SliderFloat("Transmission", &m.metallic_smoothShading_transmission_ior[2], 0.0f, 1.0f);
+    changed |= ImGui::SliderFloat("Absorption Strength", &m.thinFilmSubstrateK_absorption_pad[1], 0.0f, 10.0f);
     changed |= ImGui::SliderFloat("IOR", &m.metallic_smoothShading_transmission_ior[3], 1.0f, 3.0f);
 
     changed |= ImGui::SliderFloat("Dispersion", &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[0], 0.0f, 1.0f);
@@ -311,7 +312,7 @@ static bool drawMaterialEditor(MeshData& mesh, int& selectedMaterial) {
     changed |= ImGui::SliderFloat("Thin Film IOR", &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[2], 1.0f, 3.0f);
     changed |= ImGui::SliderFloat("Thin Film Substrate Eta", &m.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[3], 1.0f, 5.0f);
 
-    changed |= ImGui::SliderFloat("Thin Film Substrate K", &m.thinFilmSubstrateK_pad[0], 0.0f, 10.0f);
+    changed |= ImGui::SliderFloat("Thin Film Substrate K", &m.thinFilmSubstrateK_absorption_pad[0], 0.0f, 10.0f);
 
     ImGui::End();
     return changed;
@@ -745,7 +746,8 @@ static MeshData loadObjMesh(const std::string& path) {
     defaultMat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[1] = 0.0f;
     defaultMat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[2] = 1.0f;
     defaultMat.dispersion_thinFilmThickness_thinFilmIor_thinFilmSubstrateEta[3] = 1.0f;
-    defaultMat.thinFilmSubstrateK_pad[0] = 0.0f;
+    defaultMat.thinFilmSubstrateK_absorption_pad[0] = 0.0f;
+    defaultMat.thinFilmSubstrateK_absorption_pad[1] = 1.0f;
 
     mesh.materials.push_back(defaultMat);
 
